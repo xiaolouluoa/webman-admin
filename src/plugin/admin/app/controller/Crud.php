@@ -89,13 +89,16 @@ class Crud extends Base
         $where = $request->get();
         $page = (int)$request->get('page');
         $page = $page > 0 ? $page : 1;
-        $table = config('plugin.admin.database.connections.mysql.prefix') . $this->model->getTable();
+        $connectionConfig = Util::getConnectionConfig();
+        $prefix = $connectionConfig['prefix'] ?? '';
+        $table = $prefix . $this->model->getTable();
 
-        $allow_column = Util::db()->select("desc `$table`");
+        $allow_column = Util::getColumnInfo($this->model->getTable());
         if (!$allow_column) {
             throw new BusinessException('表不存在');
         }
-        $allow_column = array_column($allow_column, 'Field', 'Field');
+        $allow_column = array_keys($allow_column);
+        $allow_column = array_combine($allow_column, $allow_column);
         if (!in_array($field, $allow_column)) {
             $field = null;
         }
@@ -311,19 +314,21 @@ class Crud extends Base
      */
     protected function inputFilter(array $data): array
     {
-        $table = config('plugin.admin.database.connections.mysql.prefix') . $this->model->getTable();
-        $allow_column = $this->model->getConnection()->select("desc `$table`");
-        if (!$allow_column) {
+        $columnInfo = Util::getColumnInfo($this->model->getTable());
+        if (!$columnInfo) {
             throw new BusinessException('表不存在', 2);
         }
-        $columns = array_column($allow_column, 'Type', 'Field');
+        $columns = [];
+        foreach ($columnInfo as $field => $info) {
+            $columns[$field] = $info['type'];
+        }
         foreach ($data as $col => $item) {
             if (!isset($columns[$col])) {
                 unset($data[$col]);
                 continue;
             }
             // 非字符串类型传空则为null
-            if ($item === '' && strpos(strtolower($columns[$col]), 'varchar') === false && strpos(strtolower($columns[$col]), 'text') === false) {
+            if ($item === '' && !in_array($columns[$col], ['string', 'text', 'mediumText', 'longText', 'char', 'binary', 'json'])) {
                 $data[$col] = null;
             }
             if (is_array($item)) {

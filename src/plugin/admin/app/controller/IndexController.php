@@ -67,9 +67,26 @@ class IndexController
         $day30_user_count = User::where('created_at', '>', date('Y-m-d H:i:s', time() - 30 * 24 * 60 * 60))->count();
         // 总用户数
         $user_count = User::count();
-        // mysql版本
-        $version = Util::db()->select('select VERSION() as version');
-        $mysql_version = $version[0]->version ?? 'unknown';
+        // 数据库版本
+        $dbVersion = 'unknown';
+        try {
+            $driver = Util::getDriver();
+            if ($driver === 'mysql') {
+                $version = Util::db()->select('select VERSION() as version');
+                $dbVersion = $version[0]->version ?? 'unknown';
+            } elseif ($driver === 'pgsql') {
+                $version = Util::db()->select('SELECT version() as version');
+                $dbVersion = $version[0]->version ?? 'unknown';
+            } elseif ($driver === 'sqlite') {
+                $version = Util::db()->select('SELECT sqlite_version() as version');
+                $dbVersion = $version[0]->version ?? 'unknown';
+            } elseif ($driver === 'sqlsrv') {
+                $version = Util::db()->select("SELECT @@VERSION as version");
+                $dbVersion = $version[0]->version ?? 'unknown';
+            }
+        } catch (Throwable $e) {
+            $dbVersion = 'unknown';
+        }
 
         $day7_detail = [];
         $now = time();
@@ -88,7 +105,7 @@ class IndexController
             'workerman_version' =>  Worker::VERSION,
             'webman_version' => Util::getPackageVersion('workerman/webman-framework'),
             'admin_version' => config('plugin.admin.app.version'),
-            'mysql_version' => $mysql_version,
+            'mysql_version' => $dbVersion,
             'os' => PHP_OS,
             'day7_detail' => array_reverse($day7_detail),
         ]);

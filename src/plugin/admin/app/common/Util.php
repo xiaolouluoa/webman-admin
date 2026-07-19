@@ -15,6 +15,39 @@ use Workerman\Worker;
 class Util
 {
     /**
+     * 数据库连接名
+     * @var string
+     */
+    protected static $connectionName = 'plugin.admin.database';
+
+    /**
+     * 获取当前数据库连接名
+     * @return string
+     */
+    public static function getConnectionName(): string
+    {
+        return static::$connectionName;
+    }
+
+    /**
+     * 设置数据库连接名
+     * @param string $name
+     */
+    public static function setConnectionName(string $name): void
+    {
+        static::$connectionName = $name;
+    }
+
+    /**
+     * 获取数据库驱动类型
+     * @return string
+     */
+    public static function getDriver(): string
+    {
+        return config('database.connections.' . static::$connectionName . '.driver', 'mysql');
+    }
+
+    /**
      * 密码哈希
      * @param $password
      * @param string $algo
@@ -42,7 +75,7 @@ class Util
      */
     public static function db(): Connection
     {
-        return Db::connection('plugin.admin.mysql');
+        return Db::connection(static::$connectionName);
     }
 
     /**
@@ -51,7 +84,30 @@ class Util
      */
     public static function schema(): Builder
     {
-        return Db::schema('plugin.admin.mysql');
+        return Db::schema(static::$connectionName);
+    }
+
+    /**
+     * 获取数据库连接配置
+     * @return array
+     */
+    public static function getConnectionConfig(): array
+    {
+        return config('database.connections.' . static::$connectionName, []);
+    }
+
+    /**
+     * 获取数据库名
+     * @return string
+     */
+    public static function getDatabaseName(): string
+    {
+        $config = static::getConnectionConfig();
+        $driver = $config['driver'] ?? 'mysql';
+        if ($driver === 'sqlite') {
+            return $config['database'] ?? '';
+        }
+        return $config['database'] ?? '';
     }
 
     /**
@@ -373,6 +429,259 @@ class Util
     }
 
     /**
+     * 获取数据库列信息
+     * @param string $table
+     * @return array
+     * @throws BusinessException
+     */
+    public static function getColumnInfo(string $table): array
+    {
+        Util::checkTableName($table);
+        $schema = Util::schema();
+        $driver = Util::getDriver();
+        $columns = $schema->getColumnListing($table);
+        $result = [];
+
+        foreach ($columns as $column) {
+            $type = $schema->getColumnType($table, $column);
+            $result[$column] = [
+                'field' => $column,
+                'type' => $type,
+                'nullable' => true,
+                'default' => null,
+                'primary_key' => false,
+                'auto_increment' => false,
+                'comment' => '',
+                'length' => '',
+            ];
+        }
+
+        // 尝试获取更详细的信息，如果支持
+        try {
+            $connection = Util::db();
+            $pdo = $connection->getPdo();
+
+            if ($driver === 'mysql') {
+                $database = Util::getDatabaseName();
+                $rows = $connection->select(
+                    "SELECT * FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND table_name = ? ORDER BY ORDINAL_POSITION",
+                    [$database, $table]
+                );
+                foreach ($rows as $item) {
+                    $field = $item->COLUMN_NAME;
+                    if (isset($result[$field])) {
+                        $result[$field] = [
+                            'field' => $field,
+                            'type' => Util::typeToMethod($item->DATA_TYPE, (bool)strpos($item->COLUMN_TYPE ?? '', 'unsigned')),
+                            'comment' => $item->COLUMN_COMMENT ?? '',
+                            'default' => $item->COLUMN_DEFAULT,
+                            'length' => static::getLengthValue($item),
+                            'nullable' => ($item->IS_NULLABLE ?? 'YES') !== 'NO',
+                            'primary_key' => ($item->COLUMN_KEY ?? '') === 'PRI',
+                            'auto_increment' => strpos($item->EXTRA ?? '', 'auto_increment') !== false
+                        ];
+                    }
+                }
+            } elseif ($driver === 'pgsql') {
+                $database = Util::getDatabaseName();
+                $rows = $connection->select(
+                    "SELECT
+                        c.column_name,
+                        c.data_type,
+                        c.is_nullable,
+                        c.column_default,
+                        c.character_maximum_length,
+                        c.numeric_precision,
+                        c.numeric_scale,
+                        COALESCE(pd.description, '') as column_comment
+                    FROM information_schema.columns c
+                    LEFT JOIN pg_catalog.pg_statio_all_tables st ON st.relname = c.table_name
+                    LEFT JOIN pg_catalog.pg_description pd ON pd.objoid = st.relid AND pd.objsubid = c.ordinal_position
+                    WHERE c.table_schema = 'public' AND c.table_name = ?
+                    ORDER BY c.ordinal_position",
+                    [$table]
+                );
+                foreach ($rows as $item) {
+                    $field = $item->column_name;
+                    if (isset($result[$field])) {
+                        $result[$field] = [
+                            'field' => $field,
+                            'type' => static::pgsqlTypeToMethod($item->data_type),
+                            'comment' => $item->column_comment ?? '',
+                            'default' => $item->column_default,
+                            'length' => $item->character_maximum_length ?? '',
+                            'nullable' => ($item->is_nullable ?? 'YES') === 'YES',
+                            'primary_key' => false,
+                            'auto_increment' => false,
+                        ];
+                    }
+                }
+                // 获取主键信息
+                try {
+                    $pkRows = $connection->select(
+                        "SELECT kcu.column_name
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+                        WHERE tc.table_name = ? AND tc.constraint_type = 'PRIMARY KEY'",
+                        [$table]
+                    );
+                    foreach ($pkRows as $pk) {
+                        if (isset($result[$pk->column_name])) {
+                            $result[$pk->column_name]['primary_key'] = true;
+                        }
+                    }
+                } catch (Throwable $e) {
+                    // ignore
+                }
+            } elseif ($driver === 'sqlite') {
+                // SQLite - use PRAGMA
+                try {
+                    $rows = $connection->select("PRAGMA table_info(`$table`)");
+                    foreach ($rows as $item) {
+                        $field = $item->name;
+                        if (isset($result[$field])) {
+                            $result[$field] = [
+                                'field' => $field,
+                                'type' => static::sqliteTypeToMethod($item->type),
+                                'comment' => '',
+                                'default' => $item->dflt_value,
+                                'length' => '',
+                                'nullable' => !$item->notnull,
+                                'primary_key' => (bool)$item->pk,
+                                'auto_increment' => (bool)$item->pk && stripos($item->type ?? '', 'int') !== false,
+                            ];
+                        }
+                    }
+                } catch (Throwable $e) {
+                    // ignore
+                }
+            } elseif ($driver === 'sqlsrv') {
+                $database = Util::getDatabaseName();
+                try {
+                    $rows = $connection->select(
+                        "SELECT
+                            c.name AS column_name,
+                            t.name AS data_type,
+                            c.is_nullable,
+                            c.column_default,
+                            c.max_length,
+                            c.precision,
+                            c.scale,
+                            ep.value AS column_comment
+                        FROM sys.columns c
+                        JOIN sys.types t ON c.user_type_id = t.user_type_id
+                        LEFT JOIN sys.extended_properties ep ON ep.major_id = c.object_id AND ep.minor_id = c.column_id AND ep.name = 'MS_Description'
+                        WHERE c.object_id = OBJECT_ID(?)
+                        ORDER BY c.column_id",
+                        [$table]
+                    );
+                    foreach ($rows as $item) {
+                        $field = $item->column_name;
+                        if (isset($result[$field])) {
+                            $result[$field] = [
+                                'field' => $field,
+                                'type' => static::sqlsrvTypeToMethod($item->data_type),
+                                'comment' => $item->column_comment ?? '',
+                                'default' => $item->column_default,
+                                'length' => $item->max_length,
+                                'nullable' => (bool)$item->is_nullable,
+                                'primary_key' => false,
+                                'auto_increment' => false,
+                            ];
+                        }
+                    }
+                } catch (Throwable $e) {
+                    // ignore
+                }
+            }
+        } catch (Throwable $e) {
+            // 如果无法获取详细信息，使用schema builder的基本信息
+        }
+
+        return $result;
+    }
+
+    /**
+     * PostgreSQL类型转换
+     * @param string $type
+     * @return string
+     */
+    protected static function pgsqlTypeToMethod(string $type): string
+    {
+        $type = strtolower($type);
+        $map = [
+            'integer' => 'integer',
+            'bigint' => 'bigInteger',
+            'smallint' => 'smallInteger',
+            'character varying' => 'string',
+            'varchar' => 'string',
+            'character' => 'char',
+            'text' => 'text',
+            'boolean' => 'boolean',
+            'date' => 'date',
+            'timestamp without time zone' => 'dateTime',
+            'timestamp' => 'dateTime',
+            'time without time zone' => 'time',
+            'time' => 'time',
+            'numeric' => 'decimal',
+            'double precision' => 'double',
+            'real' => 'float',
+            'json' => 'json',
+            'jsonb' => 'json',
+        ];
+        return $map[$type] ?? $type;
+    }
+
+    /**
+     * SQLite类型转换
+     * @param string $type
+     * @return string
+     */
+    protected static function sqliteTypeToMethod(string $type): string
+    {
+        $type = strtolower($type);
+        if (strpos($type, 'int') !== false) return 'integer';
+        if ($type === 'text') return 'text';
+        if (in_array($type, ['real', 'float', 'double'])) return 'float';
+        if ($type === 'blob') return 'binary';
+        return 'string';
+    }
+
+    /**
+     * SQL Server类型转换
+     * @param string $type
+     * @return string
+     */
+    protected static function sqlsrvTypeToMethod(string $type): string
+    {
+        $type = strtolower($type);
+        $map = [
+            'int' => 'integer',
+            'bigint' => 'bigInteger',
+            'smallint' => 'smallInteger',
+            'tinyint' => 'tinyInteger',
+            'nvarchar' => 'string',
+            'varchar' => 'string',
+            'nchar' => 'char',
+            'char' => 'char',
+            'text' => 'text',
+            'ntext' => 'text',
+            'bit' => 'boolean',
+            'date' => 'date',
+            'datetime' => 'dateTime',
+            'datetime2' => 'dateTime',
+            'smalldatetime' => 'dateTime',
+            'time' => 'time',
+            'decimal' => 'decimal',
+            'numeric' => 'decimal',
+            'float' => 'double',
+            'real' => 'float',
+            'json' => 'json',
+        ];
+        return $map[$type] ?? $type;
+    }
+
+    /**
      * 按表获取摘要
      * @param $table
      * @param null $section
@@ -382,28 +691,19 @@ class Util
     public static function getSchema($table, $section = null)
     {
         Util::checkTableName($table);
-        $database = config('database.connections')['plugin.admin.mysql']['database'];
-        $schema_raw = $section !== 'table' ? Util::db()->select("select * from information_schema.COLUMNS where TABLE_SCHEMA = '$database' and table_name = '$table' order by ORDINAL_POSITION") : [];
+        $driver = Util::getDriver();
+        $columns = static::getColumnInfo($table);
         $forms = [];
-        $columns = [];
-        foreach ($schema_raw as $item) {
-            $field = $item->COLUMN_NAME;
-            $columns[$field] = [
-                'field' => $field,
-                'type' => Util::typeToMethod($item->DATA_TYPE, (bool)strpos($item->COLUMN_TYPE, 'unsigned')),
-                'comment' => $item->COLUMN_COMMENT,
-                'default' => $item->COLUMN_DEFAULT,
-                'length' => static::getLengthValue($item),
-                'nullable' => $item->IS_NULLABLE !== 'NO',
-                'primary_key' => $item->COLUMN_KEY === 'PRI',
-                'auto_increment' => strpos($item->EXTRA, 'auto_increment') !== false
-            ];
+        $data_columns = [];
+
+        foreach ($columns as $field => $info) {
+            $data_columns[$field] = $info;
 
             $forms[$field] = [
                 'field' => $field,
-                'comment' => $item->COLUMN_COMMENT,
-                'control' => static::typeToControl($item->DATA_TYPE),
-                'form_show' => $item->COLUMN_KEY !== 'PRI',
+                'comment' => $info['comment'],
+                'control' => static::typeToControl($info['type']),
+                'form_show' => !$info['primary_key'],
                 'list_show' => true,
                 'enable_sort' => false,
                 'searchable' => false,
@@ -411,31 +711,16 @@ class Util
                 'control_args' => '',
             ];
         }
-        $table_schema = $section == 'table' || !$section ? Util::db()->select("SELECT TABLE_COMMENT FROM  information_schema.`TABLES` WHERE  TABLE_SCHEMA='$database' and TABLE_NAME='$table'") : [];
-        $indexes = !$section || in_array($section, ['keys', 'table']) ? Util::db()->select("SHOW INDEX FROM `$table`") : [];
-        $keys = [];
-        $primary_key = [];
-        foreach ($indexes as $index) {
-            $key_name = $index->Key_name;
-            if ($key_name == 'PRIMARY') {
-                $primary_key[] = $index->Column_name;
-                continue;
-            }
-            if (!isset($keys[$key_name])) {
-                $keys[$key_name] = [
-                    'name' => $key_name,
-                    'columns' => [],
-                    'type' => $index->Non_unique == 0 ? 'unique' : 'normal'
-                ];
-            }
-            $keys[$key_name]['columns'][] = $index->Column_name;
-        }
+
+        // 获取表注释和主键、索引 - 使用驱动特定方法
+        $tableInfo = static::getTableInfo($table);
+        $keys = static::getTableIndexes($table);
 
         $data = [
-            'table' => ['name' => $table, 'comment' => $table_schema[0]->TABLE_COMMENT ?? '', 'primary_key' => $primary_key],
-            'columns' => $columns,
+            'table' => ['name' => $table, 'comment' => $tableInfo['comment'] ?? '', 'primary_key' => $tableInfo['primary_key'] ?? []],
+            'columns' => $data_columns,
             'forms' => $forms,
-            'keys' => array_reverse($keys, true)
+            'keys' => $keys,
         ];
 
         $schema = Option::where('name', "table_form_schema_$table")->value('value');
@@ -451,26 +736,241 @@ class Util
     }
 
     /**
+     * 获取表信息（注释、主键等）
+     * @param string $table
+     * @return array
+     */
+    public static function getTableInfo(string $table): array
+    {
+        $driver = Util::getDriver();
+        $result = ['comment' => '', 'primary_key' => []];
+
+        try {
+            if ($driver === 'mysql') {
+                $database = Util::getDatabaseName();
+                $rows = Util::db()->select(
+                    "SELECT TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                    [$database, $table]
+                );
+                if (!empty($rows)) {
+                    $result['comment'] = $rows[0]->TABLE_COMMENT ?? '';
+                }
+            } elseif ($driver === 'pgsql') {
+                $rows = Util::db()->select(
+                    "SELECT obj_description(relfilenode, 'pg_class') AS table_comment FROM pg_class WHERE relname = ?",
+                    [$table]
+                );
+                if (!empty($rows)) {
+                    $result['comment'] = $rows[0]->table_comment ?? '';
+                }
+            } elseif ($driver === 'sqlite') {
+                // SQLite 没有表注释
+                $result['comment'] = '';
+            } elseif ($driver === 'sqlsrv') {
+                $rows = Util::db()->select(
+                    "SELECT ep.value AS table_comment
+                    FROM sys.extended_properties ep
+                    WHERE ep.major_id = OBJECT_ID(?) AND ep.minor_id = 0 AND ep.name = 'MS_Description'",
+                    [$table]
+                );
+                if (!empty($rows)) {
+                    $result['comment'] = $rows[0]->table_comment ?? '';
+                }
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+
+        // 获取主键
+        try {
+            $result['primary_key'] = static::getPrimaryKeys($table);
+        } catch (Throwable $e) {
+            // ignore
+        }
+
+        return $result;
+    }
+
+    /**
+     * 获取主键列表
+     * @param string $table
+     * @return array
+     */
+    public static function getPrimaryKeys(string $table): array
+    {
+        $driver = Util::getDriver();
+        $pks = [];
+
+        try {
+            if ($driver === 'mysql') {
+                $rows = Util::db()->select("SHOW KEYS FROM `$table` WHERE Key_name = 'PRIMARY'");
+                foreach ($rows as $row) {
+                    $pks[] = $row->Column_name;
+                }
+            } elseif ($driver === 'pgsql') {
+                $rows = Util::db()->select(
+                    "SELECT kcu.column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+                    WHERE tc.table_name = ? AND tc.constraint_type = 'PRIMARY KEY'",
+                    [$table]
+                );
+                foreach ($rows as $row) {
+                    $pks[] = $row->column_name;
+                }
+            } elseif ($driver === 'sqlite') {
+                $rows = Util::db()->select("PRAGMA table_info(`$table`)");
+                foreach ($rows as $row) {
+                    if ($row->pk) {
+                        $pks[] = $row->name;
+                    }
+                }
+            } elseif ($driver === 'sqlsrv') {
+                $rows = Util::db()->select(
+                    "SELECT kcu.column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+                    WHERE tc.table_name = ? AND tc.constraint_type = 'PRIMARY KEY'",
+                    [$table]
+                );
+                foreach ($rows as $row) {
+                    $pks[] = $row->column_name;
+                }
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+
+        return $pks;
+    }
+
+    /**
+     * 获取表索引
+     * @param string $table
+     * @return array
+     */
+    public static function getTableIndexes(string $table): array
+    {
+        $driver = Util::getDriver();
+        $keys = [];
+
+        try {
+            if ($driver === 'mysql') {
+                $rows = Util::db()->select("SHOW INDEX FROM `$table`");
+                foreach ($rows as $index) {
+                    $key_name = $index->Key_name;
+                    if ($key_name === 'PRIMARY') continue;
+                    if (!isset($keys[$key_name])) {
+                        $keys[$key_name] = [
+                            'name' => $key_name,
+                            'columns' => [],
+                            'type' => $index->Non_unique == 0 ? 'unique' : 'normal'
+                        ];
+                    }
+                    $keys[$key_name]['columns'][] = $index->Column_name;
+                }
+            } elseif ($driver === 'pgsql') {
+                $rows = Util::db()->select(
+                    "SELECT
+                        i.relname AS index_name,
+                        a.attname AS column_name,
+                        ix.indisunique AS is_unique,
+                        ix.indisprimary AS is_primary
+                    FROM pg_class t
+                    JOIN pg_index ix ON t.oid = ix.indrelid
+                    JOIN pg_class i ON i.oid = ix.indexrelid
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+                    WHERE t.relname = ? AND NOT ix.indisprimary
+                    ORDER BY i.relname, a.attnum",
+                    [$table]
+                );
+                foreach ($rows as $row) {
+                    $key_name = $row->index_name;
+                    if (!isset($keys[$key_name])) {
+                        $keys[$key_name] = [
+                            'name' => $key_name,
+                            'columns' => [],
+                            'type' => $row->is_unique ? 'unique' : 'normal'
+                        ];
+                    }
+                    $keys[$key_name]['columns'][] = $row->column_name;
+                }
+            } elseif ($driver === 'sqlite') {
+                $rows = Util::db()->select("PRAGMA index_list(`$table`)");
+                foreach ($rows as $index) {
+                    $key_name = $index->name;
+                    if ($key_name === 'sqlite_autoindex_' . $table . '_1') continue;
+                    $detail = Util::db()->select("PRAGMA index_info(`$key_name`)");
+                    $columns = [];
+                    foreach ($detail as $d) {
+                        $columns[] = $d->name;
+                    }
+                    $keys[$key_name] = [
+                        'name' => $key_name,
+                        'columns' => $columns,
+                        'type' => $index->unique ? 'unique' : 'normal'
+                    ];
+                }
+            } elseif ($driver === 'sqlsrv') {
+                $rows = Util::db()->select(
+                    "SELECT
+                        i.name AS index_name,
+                        c.name AS column_name,
+                        i.is_unique,
+                        i.is_primary_key
+                    FROM sys.indexes i
+                    JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                    JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                    WHERE i.object_id = OBJECT_ID(?) AND i.is_primary_key = 0
+                    ORDER BY i.name, ic.key_ordinal",
+                    [$table]
+                );
+                foreach ($rows as $row) {
+                    $key_name = $row->index_name;
+                    if (!isset($keys[$key_name])) {
+                        $keys[$key_name] = [
+                            'name' => $key_name,
+                            'columns' => [],
+                            'type' => $row->is_unique ? 'unique' : 'normal'
+                        ];
+                    }
+                    $keys[$key_name]['columns'][] = $row->column_name;
+                }
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+
+        return array_reverse($keys, true);
+    }
+
+    /**
      * 获取字段长度或默认值
      * @param $schema
      * @return mixed|string
      */
     public static function getLengthValue($schema)
     {
-        $type = $schema->DATA_TYPE;
-        if (in_array($type, ['float', 'decimal', 'double'])) {
-            return "{$schema->NUMERIC_PRECISION},{$schema->NUMERIC_SCALE}";
+        $type = $schema->DATA_TYPE ?? $schema->type ?? '';
+        if (in_array($type, ['float', 'decimal', 'double', 'numeric'])) {
+            $precision = $schema->NUMERIC_PRECISION ?? $schema->numeric_precision ?? '';
+            $scale = $schema->NUMERIC_SCALE ?? $schema->numeric_scale ?? '';
+            return $precision ? "{$precision},{$scale}" : '';
         }
         if ($type === 'enum') {
-            return implode(',', array_map(function($item){
-                return trim($item, "'");
-            }, explode(',', substr($schema->COLUMN_TYPE, 5, -1))));
+            $colType = $schema->COLUMN_TYPE ?? '';
+            if ($colType) {
+                return implode(',', array_map(function($item){
+                    return trim($item, "'");
+                }, explode(',', substr($colType, 5, -1))));
+            }
+            return '';
         }
-        if (in_array($type, ['varchar', 'text', 'char'])) {
-            return $schema->CHARACTER_MAXIMUM_LENGTH;
+        if (in_array($type, ['varchar', 'text', 'char', 'character varying'])) {
+            return $schema->CHARACTER_MAXIMUM_LENGTH ?? $schema->character_maximum_length ?? '';
         }
         if (in_array($type, ['time', 'datetime', 'timestamp'])) {
-            return $schema->CHARACTER_MAXIMUM_LENGTH;
+            return $schema->CHARACTER_MAXIMUM_LENGTH ?? $schema->character_maximum_length ?? '';
         }
         return '';
     }

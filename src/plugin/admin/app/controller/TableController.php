@@ -64,27 +64,96 @@ class TableController extends Base
         $limit = (int)$request->get('limit', 10);
         $page = (int)$request->get('page', 1);
         $offset = ($page - 1) * $limit;
-        $database = config('database.connections')['plugin.admin.mysql']['database'];
+        $driver = Util::getDriver();
         $field = $request->get('field', 'TABLE_NAME');
         $field = Util::filterAlphaNum($field);
         $order = $request->get('order', 'asc');
-        $allow_column = ['TABLE_NAME', 'TABLE_COMMENT', 'ENGINE', 'TABLE_ROWS', 'CREATE_TIME', 'UPDATE_TIME', 'TABLE_COLLATION'];
-        if (!in_array($field, $allow_column)) {
-            $field = 'TABLE_NAME';
-        }
         $order = $order === 'asc' ? 'asc' : 'desc';
-        $total = Util::db()->select("SELECT count(*)total FROM  information_schema.`TABLES` WHERE  TABLE_SCHEMA='$database' AND TABLE_NAME like '%{$table_name}%'")[0]->total ?? 0;
-        $tables = Util::db()->select("SELECT TABLE_NAME,TABLE_COMMENT,ENGINE,TABLE_ROWS,CREATE_TIME,UPDATE_TIME,TABLE_COLLATION FROM  information_schema.`TABLES` WHERE  TABLE_SCHEMA='$database' AND TABLE_NAME like '%{$table_name}%' order by $field $order limit $offset,$limit");
 
-        if ($tables) {
-            $table_names = array_column($tables, 'TABLE_NAME');
-            $table_rows_count = [];
-            foreach ($table_names as $table_name) {
-                $table_rows_count[$table_name] = Util::db()->table($table_name)->count();
+        if ($driver === 'mysql') {
+            $database = Util::getDatabaseName();
+            $allow_column = ['TABLE_NAME', 'TABLE_COMMENT', 'ENGINE', 'TABLE_ROWS', 'CREATE_TIME', 'UPDATE_TIME', 'TABLE_COLLATION'];
+            if (!in_array($field, $allow_column)) {
+                $field = 'TABLE_NAME';
             }
-            foreach ($tables as $key => $table) {
-                $tables[$key]->TABLE_ROWS = $table_rows_count[$table->TABLE_NAME] ?? $table->TABLE_ROWS;
+            $total = Util::db()->select("SELECT count(*) as total FROM  information_schema.`TABLES` WHERE  TABLE_SCHEMA=? AND TABLE_NAME like ?", [$database, "%{$table_name}%"])[0]->total ?? 0;
+            $tables = Util::db()->select("SELECT TABLE_NAME,TABLE_COMMENT,ENGINE,TABLE_ROWS,CREATE_TIME,UPDATE_TIME,TABLE_COLLATION FROM  information_schema.`TABLES` WHERE  TABLE_SCHEMA=? AND TABLE_NAME like ? order by `$field` $order limit $offset,$limit", [$database, "%{$table_name}%"]);
+
+            if ($tables) {
+                $table_names = array_column($tables, 'TABLE_NAME');
+                $table_rows_count = [];
+                foreach ($table_names as $tbl) {
+                    $table_rows_count[$tbl] = Util::db()->table($tbl)->count();
+                }
+                foreach ($tables as $key => $table) {
+                    $tables[$key]->TABLE_ROWS = $table_rows_count[$table->TABLE_NAME] ?? $table->TABLE_ROWS;
+                }
             }
+        } elseif ($driver === 'pgsql') {
+            $database = Util::getDatabaseName();
+            $allow_column = ['TABLE_NAME', 'TABLE_COMMENT'];
+            if (!in_array($field, $allow_column)) {
+                $field = 'TABLE_NAME';
+            }
+            $total = Util::db()->select("SELECT count(*) as total FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE ?", ["%{$table_name}%"])[0]->total ?? 0;
+            $tables = Util::db()->select("SELECT table_name AS \"TABLE_NAME\", obj_description(relfilenode, 'pg_class') AS \"TABLE_COMMENT\" FROM information_schema.tables LEFT JOIN pg_class ON relname = table_name WHERE table_schema='public' AND table_name LIKE ? ORDER BY \"$field\" $order LIMIT $limit OFFSET $offset", ["%{$table_name}%"]);
+
+            if ($tables) {
+                $table_names = array_column($tables, 'TABLE_NAME');
+                $table_rows_count = [];
+                foreach ($table_names as $tbl) {
+                    $table_rows_count[$tbl] = Util::db()->table($tbl)->count();
+                }
+                foreach ($tables as $key => $table) {
+                    $tables[$key]->TABLE_ROWS = $table_rows_count[$table->TABLE_NAME] ?? 0;
+                }
+            }
+        } elseif ($driver === 'sqlite') {
+            $total = Util::db()->select("SELECT count(*) as total FROM sqlite_master WHERE type='table' AND name LIKE ?", ["%{$table_name}%"])[0]->total ?? 0;
+            $tables = Util::db()->select("SELECT name AS \"TABLE_NAME\" FROM sqlite_master WHERE type='table' AND name LIKE ? ORDER BY \"$field\" $order LIMIT $limit OFFSET $offset", ["%{$table_name}%"]);
+
+            if ($tables) {
+                $table_names = array_column($tables, 'TABLE_NAME');
+                $table_rows_count = [];
+                foreach ($table_names as $tbl) {
+                    $table_rows_count[$tbl] = Util::db()->table($tbl)->count();
+                }
+                foreach ($tables as $key => $table) {
+                    $tables[$key]->TABLE_ROWS = $table_rows_count[$table->TABLE_NAME] ?? 0;
+                    $tables[$key]->TABLE_COMMENT = '';
+                    $tables[$key]->ENGINE = '';
+                    $tables[$key]->CREATE_TIME = '';
+                    $tables[$key]->UPDATE_TIME = '';
+                    $tables[$key]->TABLE_COLLATION = '';
+                }
+            }
+        } elseif ($driver === 'sqlsrv') {
+            $database = Util::getDatabaseName();
+            $allow_column = ['TABLE_NAME'];
+            if (!in_array($field, $allow_column)) {
+                $field = 'TABLE_NAME';
+            }
+            $total = Util::db()->select("SELECT count(*) as total FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_name LIKE ?", ["%{$table_name}%"])[0]->total ?? 0;
+            $tables = Util::db()->select("SELECT table_name AS \"TABLE_NAME\" FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_name LIKE ? ORDER BY \"$field\" $order OFFSET $offset ROWS FETCH NEXT $limit ROWS ONLY", ["%{$table_name}%"]);
+
+            if ($tables) {
+                $table_names = array_column($tables, 'TABLE_NAME');
+                $table_rows_count = [];
+                foreach ($table_names as $tbl) {
+                    $table_rows_count[$tbl] = Util::db()->table($tbl)->count();
+                }
+                foreach ($tables as $key => $table) {
+                    $tables[$key]->TABLE_ROWS = $table_rows_count[$table->TABLE_NAME] ?? 0;
+                    $tables[$key]->TABLE_COMMENT = '';
+                    $tables[$key]->ENGINE = '';
+                    $tables[$key]->CREATE_TIME = '';
+                    $tables[$key]->UPDATE_TIME = '';
+                    $tables[$key]->TABLE_COLLATION = '';
+                }
+            }
+        } else {
+            $total = 0;
+            $tables = [];
         }
 
         return json(['code' => 0, 'msg' => 'ok', 'count' => $total, 'data' => $tables]);
@@ -160,12 +229,19 @@ class TableController extends Base
                 }
                 $this->createColumn($column, $table);
             }
-            $table->charset = 'utf8mb4';
-            $table->collation = 'utf8mb4_general_ci';
-            $table->engine = 'InnoDB';
+            $driver = Util::getDriver();
+            if ($driver === 'mysql') {
+                $table->charset = 'utf8mb4';
+                $table->collation = 'utf8mb4_general_ci';
+                $table->engine = 'InnoDB';
+            }
         });
 
-        Util::db()->statement("ALTER TABLE `$table_name` COMMENT $table_comment");
+        // 设置表注释（仅MySQL支持ALTER TABLE COMMENT语法）
+        $driver = Util::getDriver();
+        if ($driver === 'mysql') {
+            Util::db()->statement("ALTER TABLE `$table_name` COMMENT '" . str_replace("'", "\\'", $data['table_comment']) . "'");
+        }
 
         // 索引
         Util::schema()->table($table_name, function (Blueprint $table) use ($keys) {
@@ -293,8 +369,11 @@ class TableController extends Base
 
         $table = Util::getSchema($table_name, 'table');
         if ($table_comment !== $table['comment']) {
-            $table_comment = Util::pdoQuote($table_comment);
-            Util::db()->statement("ALTER TABLE `$table_name` COMMENT $table_comment");
+            $driver = Util::getDriver();
+            if ($driver === 'mysql') {
+                $table_comment = Util::pdoQuote($table_comment);
+                Util::db()->statement("ALTER TABLE `$table_name` COMMENT $table_comment");
+            }
         }
 
         $old_columns = Util::getSchema($table_name, 'columns');
@@ -320,8 +399,19 @@ class TableController extends Base
         $old_columns_names = array_column($old_columns, 'field');
         $drop_column_names = array_diff($old_columns_names, $exists_column_names);
         $drop_column_names = Util::filterAlphaNum($drop_column_names);
+        $driver = Util::getDriver();
         foreach ($drop_column_names as $drop_column_name) {
-            Util::db()->statement("ALTER TABLE `$table_name` DROP COLUMN `$drop_column_name`");
+            if ($driver === 'mysql') {
+                Util::db()->statement("ALTER TABLE `$table_name` DROP COLUMN `$drop_column_name`");
+            } elseif ($driver === 'pgsql') {
+                Util::db()->statement("ALTER TABLE \"$table_name\" DROP COLUMN \"$drop_column_name\"");
+            } elseif ($driver === 'sqlite') {
+                Util::schema()->table($table_name, function (Blueprint $table) use ($drop_column_name) {
+                    $table->dropColumn($drop_column_name);
+                });
+            } elseif ($driver === 'sqlsrv') {
+                Util::db()->statement("ALTER TABLE [$table_name] DROP COLUMN [$drop_column_name]");
+            }
         }
 
         $old_keys = Util::getSchema($table_name, 'keys');
@@ -362,12 +452,37 @@ class TableController extends Base
 
         // 变更主键
         if ($old_primary_key != $primary_key) {
-            if ($old_primary_key) {
-                Util::db()->statement("ALTER TABLE `$table_name` DROP PRIMARY KEY");
-            }
-            if ($primary_key) {
-                $primary_key = Util::filterAlphaNum($primary_key);
-                Util::db()->statement("ALTER TABLE `$table_name` ADD PRIMARY KEY(`$primary_key`)");
+            $driver = Util::getDriver();
+            if ($driver === 'mysql') {
+                if ($old_primary_key) {
+                    Util::db()->statement("ALTER TABLE `$table_name` DROP PRIMARY KEY");
+                }
+                if ($primary_key) {
+                    $primary_key = Util::filterAlphaNum($primary_key);
+                    Util::db()->statement("ALTER TABLE `$table_name` ADD PRIMARY KEY(`$primary_key`)");
+                }
+            } elseif ($driver === 'pgsql') {
+                if ($old_primary_key) {
+                    Util::db()->statement("ALTER TABLE \"$table_name\" DROP CONSTRAINT \"{$table_name}_pkey\"");
+                }
+                if ($primary_key) {
+                    $primary_key = Util::filterAlphaNum($primary_key);
+                    Util::db()->statement("ALTER TABLE \"$table_name\" ADD PRIMARY KEY(\"$primary_key\")");
+                }
+            } elseif ($driver === 'sqlite') {
+                // SQLite doesn't support DROP PRIMARY KEY directly
+                // This is a limitation - would need to recreate the table
+            } elseif ($driver === 'sqlsrv') {
+                if ($old_primary_key) {
+                    $pk_name = Util::db()->select("SELECT name FROM sys.key_constraints WHERE type = 'PK' AND parent_object_id = OBJECT_ID(?)", [$table_name]);
+                    if (!empty($pk_name)) {
+                        Util::db()->statement("ALTER TABLE [$table_name] DROP CONSTRAINT [{$pk_name[0]->name}]");
+                    }
+                }
+                if ($primary_key) {
+                    $primary_key = Util::filterAlphaNum($primary_key);
+                    Util::db()->statement("ALTER TABLE [$table_name] ADD PRIMARY KEY([$primary_key])");
+                }
             }
         }
 
@@ -568,7 +683,31 @@ class TableController extends Base
         $incrementing = '';
         $columns = [];
         try {
-            $database = config('database.connections')['plugin.admin.mysql']['database'];
+            $incrementing = '';
+        $columns = [];
+        try {
+            $columnInfo = Util::getColumnInfo($table);
+            foreach ($columnInfo as $field => $info) {
+                if ($info['primary_key']) {
+                    $pk = $field;
+                    $info['comment'] = $info['comment'] ? $info['comment'] . "(主键)" : "(主键)";
+                    if (strpos(strtolower($info['type']), 'int') === false) {
+                        $incrementing = <<<EOF
+    /**
+     * Indicates if the model's ID is auto-incrementing.
+     *
+     * @var bool
+     */
+    public \$incrementing = false;
+
+EOF;
+                    }
+                }
+                $type = $this->getType($info['type']);
+                $properties .= " * @property $type \${$field} {$info['comment']}\n";
+                $columns[$field] = $field;
+            }
+        } catch (Throwable $e) {echo $e;}
             //plugin.admin.mysql
             foreach (Util::db()->select("select COLUMN_NAME,DATA_TYPE,COLUMN_KEY,COLUMN_COMMENT from INFORMATION_SCHEMA.COLUMNS where table_name = '$table' and table_schema = '$database' order by ORDINAL_POSITION") as $item) {
                 if ($item->COLUMN_KEY === 'PRI') {
@@ -1229,11 +1368,12 @@ EOF;
         $format = $request->get('format', 'normal');
         $limit = $request->get('limit', $format === 'tree' ? 5000 : 10);
 
-        $allow_column = Util::db()->select("desc `$table`");
+        $allow_column = Util::getColumnInfo($table);
         if (!$allow_column) {
             return $this->json(2, '表不存在');
         }
-        $allow_column = array_column($allow_column, 'Field', 'Field');
+        $allow_column = array_keys($allow_column);
+        $allow_column = array_combine($allow_column, $allow_column);
         if (!in_array($field, $allow_column)) {
             $field = current($allow_column);
         }
@@ -1302,18 +1442,21 @@ EOF;
         }
         $table = Util::filterAlphaNum($request->input('table', ''));
         $data = $request->post();
-        $allow_column = Util::db()->select("desc `$table`");
-        if (!$allow_column) {
+        $columnInfo = Util::getColumnInfo($table);
+        if (!$columnInfo) {
             throw new BusinessException('表不存在', 2);
         }
-        $columns = array_column($allow_column, 'Type', 'Field');
+        $columns = [];
+        foreach ($columnInfo as $field => $info) {
+            $columns[$field] = $info['type'];
+        }
         foreach ($data as $col => $item) {
             if (!isset($columns[$col])) {
                 unset($data[$col]);
                 continue;
             }
             // 非字符串类型传空则为null
-            if ($item === '' && strpos(strtolower($columns[$col]), 'varchar') === false && strpos(strtolower($columns[$col]), 'text') === false) {
+            if ($item === '' && !in_array($columns[$col], ['string', 'text', 'mediumText', 'longText', 'char', 'binary', 'json'])) {
                 $data[$col] = null;
             }
             if (is_array($item)) {
@@ -1368,18 +1511,21 @@ EOF;
         $primary_key = $primary_keys[0];
         $value = $request->post($primary_key);
         $data = $request->post();
-        $allow_column = Util::db()->select("desc `$table`");
-        if (!$allow_column) {
+        $columnInfo = Util::getColumnInfo($table);
+        if (!$columnInfo) {
             throw new BusinessException('表不存在', 2);
         }
-        $columns = array_column($allow_column, 'Type', 'Field');
+        $columns = [];
+        foreach ($columnInfo as $field => $info) {
+            $columns[$field] = $info['type'];
+        }
         foreach ($data as $col => $item) {
             if (!isset($columns[$col])) {
                 unset($data[$col]);
                 continue;
             }
             // 非字符串类型传空则为null
-            if ($item === '' && strpos(strtolower($columns[$col]), 'varchar') === false && strpos(strtolower($columns[$col]), 'text') === false) {
+            if ($item === '' && !in_array($columns[$col], ['string', 'text', 'mediumText', 'longText', 'char', 'binary', 'json'])) {
                 $data[$col] = null;
             }
             if (is_array($item)) {
@@ -1541,11 +1687,34 @@ EOF;
         $comment = Util::pdoQuote($column['comment']);
         $auto_increment = $column['auto_increment'];
         $length = (int)$column['length'];
+        $driver = Util::getDriver();
 
         if ($column['primary_key']) {
             $default = null;
         }
 
+        if ($driver !== 'mysql') {
+            // 非MySQL数据库使用Schema Builder的change方法
+            Util::schema()->table($table, function (Blueprint $blueprint) use ($column, $method, $field, $old_field, $nullable, $default, $auto_increment, $comment, $length) {
+                $args = [$field];
+                if (in_array($method, ['string', 'char']) && $length) {
+                    $args[] = $length;
+                }
+                if (method_exists($blueprint, $method)) {
+                    $col = call_user_func_array([$blueprint, $method], $args);
+                    if ($col) {
+                        $col->nullable($nullable);
+                        if ($default !== null && $method !== 'text') {
+                            $col->default($default);
+                        }
+                        $col->change();
+                    }
+                }
+            });
+            return;
+        }
+
+        // MySQL-specific ALTER TABLE syntax
         if ($old_field && $old_field !== $field) {
             $sql = "ALTER TABLE `$table` CHANGE COLUMN `$old_field` `$field` ";
         } else {
