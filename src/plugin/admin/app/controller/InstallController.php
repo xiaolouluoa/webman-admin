@@ -46,6 +46,31 @@ class InstallController extends Base
         $port = (int)$request->post('port') ?: 3306;
         $overwrite = $request->post('overwrite');
 
+        // 根据驱动类型自动设置默认端口
+        if (!$request->post('port')) {
+            $portMap = ['mysql' => 3306, 'pgsql' => 5432, 'sqlsrv' => 1433, 'sqlite' => 0];
+            $port = $portMap[$driver] ?? 3306;
+        }
+
+        // SQLite 特殊处理
+        if ($driver === 'sqlite') {
+            $host = '';
+            $user = '';
+            $password = '';
+            $port = 0;
+            if (!$database) {
+                $database = base_path() . '/plugin/admin/database.sqlite';
+            } elseif (!preg_match('#^/#', $database) && !preg_match('#^[a-zA-Z]:#', $database)) {
+                // 相对路径
+                $database = base_path() . '/' . ltrim($database, '/');
+            }
+            // 确保目录存在
+            $dbDir = dirname($database);
+            if (!is_dir($dbDir)) {
+                mkdir($dbDir, 0777, true);
+            }
+        }
+
         try {
             $db = $this->getPdo($driver, $host, $user, $password, $port, $database);
 
@@ -113,7 +138,15 @@ class InstallController extends Base
             }
         } else {
             foreach ($tables_conflict as $table) {
-                $db->exec("DROP TABLE IF EXISTS \"$table\"");
+                if ($driver === 'mysql') {
+                    $db->exec("DROP TABLE IF EXISTS `$table`");
+                } elseif ($driver === 'pgsql') {
+                    $db->exec("DROP TABLE IF EXISTS \"$table\"");
+                } elseif ($driver === 'sqlite') {
+                    $db->exec("DROP TABLE IF EXISTS \"$table\"");
+                } elseif ($driver === 'sqlsrv') {
+                    $db->exec("DROP TABLE IF EXISTS [$table]");
+                }
             }
         }
 
@@ -185,8 +218,15 @@ class InstallController extends Base
         $adminsTable = $tablePrefix . 'wa_admins';
         $adminRolesTable = $tablePrefix . 'wa_admin_roles';
 
-        $pdo->query("select * from `$adminsTable`")->fetchAll();
-        $smt = $pdo->prepare("insert into `$adminsTable` (`username`, `password`, `nickname`, `created_at`, `updated_at`) values (:username, :password, :nickname, :created_at, :updated_at)");
+        // 根据驱动类型使用不同的引用符号
+        $q = function($name) use ($driver) {
+            if ($driver === 'mysql') return "`$name`";
+            if ($driver === 'sqlsrv') return "[$name]";
+            return "\"$name\"";
+        };
+
+        $pdo->query("select * from " . $q($adminsTable))->fetchAll();
+        $smt = $pdo->prepare("insert into " . $q($adminsTable) . " (" . $q('username') . ", " . $q('password') . ", " . $q('nickname') . ", " . $q('created_at') . ", " . $q('updated_at') . ") values (:username, :password, :nickname, :created_at, :updated_at)");
         $time = date('Y-m-d H:i:s');
         $data = [
             'username' => $username,
@@ -201,7 +241,7 @@ class InstallController extends Base
         $smt->execute();
         $admin_id = $pdo->lastInsertId();
 
-        $smt = $pdo->prepare("insert into `$adminRolesTable` (`role_id`, `admin_id`) values (:role_id, :admin_id)");
+        $smt = $pdo->prepare("insert into " . $q($adminRolesTable) . " (" . $q('role_id') . ", " . $q('admin_id') . ") values (:role_id, :admin_id)");
         $smt->bindValue('role_id', 1);
         $smt->bindValue('admin_id', $admin_id);
         $smt->execute();
@@ -219,6 +259,11 @@ class InstallController extends Base
      */
     protected function addMenu(array $menu, \PDO $pdo, string $driver = 'mysql'): int
     {
+        $q = function($name) use ($driver) {
+            if ($driver === 'mysql') return "`$name`";
+            if ($driver === 'sqlsrv') return "[$name]";
+            return "\"$name\"";
+        };
         $allow_columns = ['title', 'key', 'icon', 'href', 'pid', 'weight', 'type'];
         $data = [];
         foreach ($allow_columns as $column) {
@@ -234,7 +279,7 @@ class InstallController extends Base
         }
         $columns = array_keys($data);
         foreach ($columns as $k => $column) {
-            $columns[$k] = "\"$column\"";
+            $columns[$k] = $q($column);
         }
         $sql = "insert into wa_rules (" .implode(',', $columns). ") values (" . implode(',', $values) . ")";
         $smt = $pdo->prepare($sql);
@@ -254,6 +299,12 @@ class InstallController extends Base
      */
     protected function importMenu(array $menu_tree, \PDO $pdo, string $driver = 'mysql')
     {
+        $q = function($name) use ($driver) {
+            if ($driver === 'mysql') return "`$name`";
+            if ($driver === 'sqlsrv') return "[$name]";
+            return "\"$name\"";
+        };
+
         if (is_numeric(key($menu_tree)) && !isset($menu_tree['key'])) {
             foreach ($menu_tree as $item) {
                 $this->importMenu($item, $pdo, $driver);
@@ -262,7 +313,7 @@ class InstallController extends Base
         }
         $children = $menu_tree['children'] ?? [];
         unset($menu_tree['children']);
-        $smt = $pdo->prepare("select * from wa_rules where \"key\"=:key limit 1");
+        $smt = $pdo->prepare("select * from wa_rules where " . $q('key') . "=:key limit 1");
         $smt->execute(['key' => $menu_tree['key']]);
         $old_menu = $smt->fetch();
         if ($old_menu) {
@@ -272,7 +323,7 @@ class InstallController extends Base
                 'icon' => $menu_tree['icon'] ?? '',
                 'key' => $menu_tree['key'],
             ];
-            $sql = "update wa_rules set title=:title, icon=:icon where \"key\"=:key";
+            $sql = "update wa_rules set title=:title, icon=:icon where " . $q('key') . "=:key";
             $smt = $pdo->prepare($sql);
             $smt->execute($params);
         } else {
@@ -459,7 +510,6 @@ return  [
 ];
 EOF;
         } elseif ($driver === 'sqlite') {
-            $dbPath = base_path() . '/plugin/admin/database.sqlite';
             return <<<EOF
 <?php
 return  [
@@ -467,7 +517,7 @@ return  [
     'connections' => [
         'sqlite' => [
             'driver'   => 'sqlite',
-            'database' => '$dbPath',
+            'database' => '$database',
             'prefix'   => '',
         ],
     ],

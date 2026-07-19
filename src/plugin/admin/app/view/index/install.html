@@ -19,33 +19,55 @@
                             <div>
                                 <form class="layui-form" action="javascript:void(0);" style="margin: 0 auto;max-width: 460px;padding-top: 40px;">
                                     <div class="layui-form-item">
-                                        <label class="layui-form-label">用户名</label>
+                                        <label class="layui-form-label">数据库类型</label>
                                         <div class="layui-input-block">
-                                            <input type="text" placeholder="请填写入用户名" name="user" class="layui-input" lay-verify="required" required value="root" autocomplete="off"/>
+                                            <select name="driver" id="driver-select" lay-filter="driver" lay-verify="required" required>
+                                                <option value="mysql" selected>MySQL</option>
+                                                <option value="pgsql">PostgreSQL</option>
+                                                <option value="sqlite">SQLite</option>
+                                                <option value="sqlsrv">SQL Server</option>
+                                            </select>
                                         </div>
                                     </div>
-                                    <div class="layui-form-item">
-                                        <label class="layui-form-label">密码</label>
-                                        <div class="layui-input-block">
-                                            <input type="password" placeholder="请填写入密码" name="password" class="layui-input" autocomplete="off"/>
+                                    <div id="mysql-fields">
+                                        <div class="layui-form-item">
+                                            <label class="layui-form-label">用户名</label>
+                                            <div class="layui-input-block">
+                                                <input type="text" placeholder="请填写入用户名" name="user" class="layui-input" lay-verify="required" required value="root" autocomplete="off"/>
+                                            </div>
+                                        </div>
+                                        <div class="layui-form-item">
+                                            <label class="layui-form-label">密码</label>
+                                            <div class="layui-input-block">
+                                                <input type="password" placeholder="请填写入密码" name="password" class="layui-input" autocomplete="off"/>
+                                            </div>
+                                        </div>
+                                        <div class="layui-form-item">
+                                            <label class="layui-form-label">数据库</label>
+                                            <div class="layui-input-block">
+                                                <input type="text" placeholder="请填写入数据库" name="database" class="layui-input" lay-verify="required" required value="webman_admin" id="database-input"/>
+                                            </div>
+                                        </div>
+                                        <div class="layui-form-item">
+                                            <label class="layui-form-label">host</label>
+                                            <div class="layui-input-block">
+                                                <input type="text" placeholder="请填写入数据库host" name="host" class="layui-input" lay-verify="required" required value="127.0.0.1" id="host-input"/>
+                                            </div>
+                                        </div>
+                                        <div class="layui-form-item">
+                                            <label class="layui-form-label">端口</label>
+                                            <div class="layui-input-block">
+                                                <input type="number" placeholder="请填写入数据库端口" name="port" class="layui-input" required value="3306" id="port-input"/>
+                                            </div>
                                         </div>
                                     </div>
-                                    <div class="layui-form-item">
-                                        <label class="layui-form-label">数据库</label>
-                                        <div class="layui-input-block">
-                                            <input type="text" placeholder="请填写入数据库" name="database" class="layui-input" lay-verify="required" required value="webman_admin"/>
-                                        </div>
-                                    </div>
-                                    <div class="layui-form-item">
-                                        <label class="layui-form-label">host</label>
-                                        <div class="layui-input-block">
-                                            <input type="text" placeholder="请填写入数据库host" name="host" class="layui-input" lay-verify="required" required value="127.0.0.1"/>
-                                        </div>
-                                    </div>
-                                    <div class="layui-form-item">
-                                        <label class="layui-form-label">端口</label>
-                                        <div class="layui-input-block">
-                                            <input type="number" placeholder="请填写入数据库端口" name="port" class="layui-input" required value="3306" />
+                                    <div id="sqlite-fields" style="display:none;">
+                                        <div class="layui-form-item">
+                                            <label class="layui-form-label">数据库路径</label>
+                                            <div class="layui-input-block">
+                                                <input type="text" placeholder="SQLite 数据库文件路径" name="database" class="layui-input" value="plugin/admin/database.sqlite" id="sqlite-path"/>
+                                                <div style="color: #999;font-size: 12px;margin-top: 5px;">留空则使用默认路径 plugin/admin/database.sqlite</div>
+                                            </div>
                                         </div>
                                     </div>
                                     <div class="layui-form-item">
@@ -151,13 +173,81 @@
             }]
         });
 
+        // 数据库类型切换事件
+        var driverPortMap = {
+            mysql: 3306,
+            pgsql: 5432,
+            sqlite: 0,
+            sqlsrv: 1433
+        };
+        var driverHostMap = {
+            mysql: "127.0.0.1",
+            pgsql: "127.0.0.1",
+            sqlite: "",
+            sqlsrv: "127.0.0.1"
+        };
+        var driverDbMap = {
+            mysql: "webman_admin",
+            pgsql: "webman_admin",
+            sqlite: "plugin/admin/database.sqlite",
+            sqlsrv: "webman_admin"
+        };
+        var driverUserMap = {
+            mysql: "root",
+            pgsql: "postgres",
+            sqlite: "",
+            sqlsrv: "sa"
+        };
+
+        form.on("select(driver)", function(data) {
+            var driver = data.value;
+            if (driver === "sqlite") {
+                $("#mysql-fields").hide();
+                $("#sqlite-fields").show();
+                // 清除验证
+                $("#mysql-fields input").each(function() {
+                    $(this).removeAttr("lay-verify required");
+                });
+                // 设置默认值
+                $("#sqlite-path").val(driverDbMap[driver]);
+            } else {
+                $("#mysql-fields").show();
+                $("#sqlite-fields").hide();
+                $("#host-input").val(driverHostMap[driver]);
+                $("#port-input").val(driverPortMap[driver]);
+                $("#database-input").val(driverDbMap[driver]);
+                // 恢复验证
+                $("#mysql-fields input[name='host'], #mysql-fields input[name='database']").each(function() {
+                    $(this).attr("lay-verify", "required").attr("required", "required");
+                });
+            }
+            form.render();
+        });
+
         form.on("submit(formStep)", function(data) {
+            var driver = data.field.driver;
+            var postData = data.field;
+
+            // SQLite 特殊处理
+            if (driver === "sqlite") {
+                postData.host = "";
+                postData.port = 0;
+                postData.user = "";
+                postData.password = "";
+                if (!postData.database) {
+                    postData.database = "plugin/admin/database.sqlite";
+                }
+            }
+
+            // 端口转换为整数
+            postData.port = parseInt(postData.port) || 0;
+
             let loading = layer.load();
             $.ajax({
                 url: "/app/admin/install/step1",
                 type: "POST",
                 dataType: "json",
-                data: data.field,
+                data: postData,
                 success: function (res) {
                     if (res.code) {
                         return layui.popup.failure(res.msg);
