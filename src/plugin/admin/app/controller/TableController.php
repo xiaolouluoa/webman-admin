@@ -4,6 +4,7 @@ namespace plugin\admin\app\controller;
 
 use Doctrine\Inflector\InflectorFactory;
 use Illuminate\Database\Schema\Blueprint;
+use plugin\admin\app\common\Database;
 use plugin\admin\app\common\Layui;
 use plugin\admin\app\common\Util;
 use plugin\admin\app\model\Role;
@@ -64,28 +65,13 @@ class TableController extends Base
         $limit = (int)$request->get('limit', 10);
         $page = (int)$request->get('page', 1);
         $offset = ($page - 1) * $limit;
-        $database = config('database.connections')['plugin.admin.mysql']['database'];
         $field = $request->get('field', 'TABLE_NAME');
         $field = Util::filterAlphaNum($field);
         $order = $request->get('order', 'asc');
-        $allow_column = ['TABLE_NAME', 'TABLE_COMMENT', 'ENGINE', 'TABLE_ROWS', 'CREATE_TIME', 'UPDATE_TIME', 'TABLE_COLLATION'];
-        if (!in_array($field, $allow_column)) {
-            $field = 'TABLE_NAME';
-        }
-        $order = $order === 'asc' ? 'asc' : 'desc';
-        $total = Util::db()->select("SELECT count(*)total FROM  information_schema.`TABLES` WHERE  TABLE_SCHEMA='$database' AND TABLE_NAME like '%{$table_name}%'")[0]->total ?? 0;
-        $tables = Util::db()->select("SELECT TABLE_NAME,TABLE_COMMENT,ENGINE,TABLE_ROWS,CREATE_TIME,UPDATE_TIME,TABLE_COLLATION FROM  information_schema.`TABLES` WHERE  TABLE_SCHEMA='$database' AND TABLE_NAME like '%{$table_name}%' order by $field $order limit $offset,$limit");
 
-        if ($tables) {
-            $table_names = array_column($tables, 'TABLE_NAME');
-            $table_rows_count = [];
-            foreach ($table_names as $table_name) {
-                $table_rows_count[$table_name] = Util::db()->table($table_name)->count();
-            }
-            foreach ($tables as $key => $table) {
-                $tables[$key]->TABLE_ROWS = $table_rows_count[$table->TABLE_NAME] ?? $table->TABLE_ROWS;
-            }
-        }
+        $adapter = Util::dbAdapter();
+        $total = $adapter->getTableCount($table_name);
+        $tables = $adapter->getTables($table_name, $field, $order, $offset, $limit);
 
         return json(['code' => 0, 'msg' => 'ok', 'count' => $total, 'data' => $tables]);
     }
@@ -160,12 +146,15 @@ class TableController extends Base
                 }
                 $this->createColumn($column, $table);
             }
-            $table->charset = 'utf8mb4';
-            $table->collation = 'utf8mb4_general_ci';
-            $table->engine = 'InnoDB';
+            // 根据数据库类型设置引擎/额外参数
+            $extra = Util::dbAdapter()->getCreateTableExtra();
+            if ($extra) {
+                $table->engine = 'InnoDB';
+            }
         });
 
-        Util::db()->statement("ALTER TABLE `$table_name` COMMENT $table_comment");
+        // 设置表注释
+        Util::dbAdapter()->setTableComment($table_name, $table_comment);
 
         // 索引
         Util::schema()->table($table_name, function (Blueprint $table) use ($keys) {
@@ -293,8 +282,7 @@ class TableController extends Base
 
         $table = Util::getSchema($table_name, 'table');
         if ($table_comment !== $table['comment']) {
-            $table_comment = Util::pdoQuote($table_comment);
-            Util::db()->statement("ALTER TABLE `$table_name` COMMENT $table_comment");
+            Util::dbAdapter()->setTableComment($table_name, $table_comment);
         }
 
         $old_columns = Util::getSchema($table_name, 'columns');
@@ -362,12 +350,19 @@ class TableController extends Base
 
         // 变更主键
         if ($old_primary_key != $primary_key) {
+            $adapter = Util::dbAdapter();
             if ($old_primary_key) {
-                Util::db()->statement("ALTER TABLE `$table_name` DROP PRIMARY KEY");
+                $sql = $adapter->buildDropPrimaryKeySql($table_name);
+                if ($sql) {
+                    Util::db()->statement($sql);
+                }
             }
             if ($primary_key) {
                 $primary_key = Util::filterAlphaNum($primary_key);
-                Util::db()->statement("ALTER TABLE `$table_name` ADD PRIMARY KEY(`$primary_key`)");
+                $sql = $adapter->buildAddPrimaryKeySql($table_name, $primary_key);
+                if ($sql) {
+                    Util::db()->statement($sql);
+                }
             }
         }
 
@@ -572,9 +567,8 @@ class TableController extends Base
         $incrementing = '';
         $columns = [];
         try {
-            $database = config('database.connections')['plugin.admin.mysql']['database'];
-            //plugin.admin.mysql
-            foreach (Util::db()->select("select COLUMN_NAME,DATA_TYPE,COLUMN_KEY,COLUMN_COMMENT from INFORMATION_SCHEMA.COLUMNS where table_name = '$table' and table_schema = '$database' order by ORDINAL_POSITION") as $item) {
+            $modelColumns = Util::dbAdapter()->getModelColumns($table);
+            foreach ($modelColumns as $item) {
                 if ($item->COLUMN_KEY === 'PRI') {
                     $pk = $item->COLUMN_NAME;
                     $item->COLUMN_COMMENT .= '(主键)';
@@ -1250,11 +1244,12 @@ EOF;
         $format = $request->get('format', 'normal');
         $limit = $request->get('limit', $format === 'tree' ? 5000 : 10);
 
-        $allow_column = Util::db()->select("desc `$table`");
+        $allow_column = Util::dbAdapter()->getTableColumns($table);
         if (!$allow_column) {
             return $this->json(2, '表不存在');
         }
-        $allow_column = array_column($allow_column, 'Field', 'Field');
+        $allow_column = array_keys($allow_column);
+        $allow_column = array_combine($allow_column, $allow_column);
         if (!in_array($field, $allow_column)) {
             $field = current($allow_column);
         }
@@ -1323,18 +1318,22 @@ EOF;
         }
         $table = Util::filterAlphaNum($request->input('table', ''));
         $data = $request->post();
-        $allow_column = Util::db()->select("desc `$table`");
-        if (!$allow_column) {
+        $columns = Util::dbAdapter()->getTableColumns($table);
+        if (!$columns) {
             throw new BusinessException('表不存在', 2);
         }
-        $columns = array_column($allow_column, 'Type', 'Field');
+        $columnTypes = [];
+        foreach ($columns as $field => $info) {
+            $columnTypes[$field] = $info['type'];
+        }
         foreach ($data as $col => $item) {
-            if (!isset($columns[$col])) {
+            if (!isset($columnTypes[$col])) {
                 unset($data[$col]);
                 continue;
             }
             // 非字符串类型传空则为null
-            if ($item === '' && strpos(strtolower($columns[$col]), 'varchar') === false && strpos(strtolower($columns[$col]), 'text') === false) {
+            $type = strtolower($columnTypes[$col]);
+            if ($item === '' && strpos($type, 'varchar') === false && strpos($type, 'text') === false && strpos($type, 'char') === false) {
                 $data[$col] = null;
             }
             if (is_array($item)) {
@@ -1346,10 +1345,10 @@ EOF;
             }
         }
         $datetime = date('Y-m-d H:i:s');
-        if (isset($columns['created_at']) && empty($data['created_at'])) {
+        if (isset($columnTypes['created_at']) && empty($data['created_at'])) {
             $data['created_at'] = $datetime;
         }
-        if (isset($columns['updated_at']) && empty($data['updated_at'])) {
+        if (isset($columnTypes['updated_at']) && empty($data['updated_at'])) {
             $data['updated_at'] = $datetime;
         }
         $id = Util::db()->table($table)->insertGetId($data);
@@ -1389,18 +1388,22 @@ EOF;
         $primary_key = $primary_keys[0];
         $value = $request->post($primary_key);
         $data = $request->post();
-        $allow_column = Util::db()->select("desc `$table`");
-        if (!$allow_column) {
+        $columns = Util::dbAdapter()->getTableColumns($table);
+        if (!$columns) {
             throw new BusinessException('表不存在', 2);
         }
-        $columns = array_column($allow_column, 'Type', 'Field');
+        $columnTypes = [];
+        foreach ($columns as $field => $info) {
+            $columnTypes[$field] = $info['type'];
+        }
         foreach ($data as $col => $item) {
-            if (!isset($columns[$col])) {
+            if (!isset($columnTypes[$col])) {
                 unset($data[$col]);
                 continue;
             }
             // 非字符串类型传空则为null
-            if ($item === '' && strpos(strtolower($columns[$col]), 'varchar') === false && strpos(strtolower($columns[$col]), 'text') === false) {
+            $type = strtolower($columnTypes[$col]);
+            if ($item === '' && strpos($type, 'varchar') === false && strpos($type, 'text') === false && strpos($type, 'char') === false) {
                 $data[$col] = null;
             }
             if (is_array($item)) {
@@ -1416,7 +1419,7 @@ EOF;
             }
         }
         $datetime = date('Y-m-d H:i:s');
-        if (isset($columns['updated_at']) && empty($data['updated_at'])) {
+        if (isset($columnTypes['updated_at']) && empty($data['updated_at'])) {
             $data['updated_at'] = $datetime;
         }
         Util::db()->table($table)->where($primary_key, $value)->update($data);
@@ -1554,87 +1557,25 @@ EOF;
     protected function modifyColumn($column, $table)
     {
         $table = Util::filterAlphaNum($table);
-        $method = Util::filterAlphaNum($column['type']);
-        $field = Util::filterAlphaNum($column['field']);
-        $old_field = Util::filterAlphaNum($column['old_field'] ?? null);
-        $nullable = $column['nullable'];
-        $default = $column['default'] !== null ? Util::pdoQuote($column['default']) : null;
-        $comment = Util::pdoQuote($column['comment']);
-        $auto_increment = $column['auto_increment'];
-        $length = (int)$column['length'];
-
-        if ($column['primary_key']) {
-            $default = null;
+        $column['field'] = Util::filterAlphaNum($column['field']);
+        if (isset($column['old_field'])) {
+            $column['old_field'] = Util::filterAlphaNum($column['old_field']);
         }
 
-        if ($old_field && $old_field !== $field) {
-            $sql = "ALTER TABLE `$table` CHANGE COLUMN `$old_field` `$field` ";
-        } else {
-            $sql = "ALTER TABLE `$table` MODIFY `$field` ";
-        }
-
-        if (stripos($method, 'integer') !== false) {
-            $type = str_ireplace('integer', 'int', $method);
-            if (stripos($method, 'unsigned') !== false) {
-                $type = str_ireplace('unsigned', '', $type);
-                $sql .= "$type ";
-                $sql .= 'unsigned ';
-            } else {
-                $sql .= "$type ";
-            }
-            if ($auto_increment) {
-                $column['nullable'] = false;
-                $column['default'] = null;
-                $sql .= 'AUTO_INCREMENT ';
-            }
-        } else {
-            switch ($method) {
-                case 'string':
-                    $length = $length ?: 255;
-                    $sql .= "varchar($length) ";
-                    break;
-                case 'char':
-                case 'time':
-                    $sql .= $length ? "$method($length) " : "$method ";
-                    break;
-                case 'enum':
-                    $args = array_map('trim', explode(',', (string)$column['length']));
-                    foreach ($args as $key => $value) {
-                        $args[$key] = Util::pdoQuote($value);
-                    }
-                    $sql .= 'enum(' . implode(',', $args) . ') ';
-                    break;
-                case 'double':
-                case 'float':
-                case 'decimal':
-                    if (trim($column['length'])) {
-                        $args = array_map('intval', explode(',', $column['length']));
-                        $args[1] = $args[1] ?? $args[0];
-                        $sql .= "$method($args[0], $args[1]) ";
-                        break;
-                    }
-                    $sql .= "$method ";
-                    break;
-                default :
-                    $sql .= "$method ";
-
-            }
-        }
-
-        if (!$nullable) {
-            $sql .= 'NOT NULL ';
-        }
-
-        if ($method != 'text' && $default !== null) {
-            $sql .= "DEFAULT $default ";
-        }
-
-        if ($comment !== null) {
-            $sql .= "COMMENT $comment ";
+        $sql = Util::dbAdapter()->buildModifyColumnSql($column, $table);
+        if (!$sql) {
+            // SQLite等不支持ALTER MODIFY的情况
+            echo "Skipping column modification for {$column['field']} - not supported on this database\n";
+            return;
         }
 
         echo "$sql\n";
-        Util::db()->statement($sql);
+        $statements = explode(";\n", $sql);
+        foreach ($statements as $stmt) {
+            if (trim($stmt)) {
+                Util::db()->statement($stmt);
+            }
+        }
     }
 
     /**

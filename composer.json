@@ -2,10 +2,11 @@
   "name": "webman/admin",
   "type": "project",
   "license": "MIT",
-  "description": "Webman Admin",
+  "description": "Webman Admin - Multi-database supported",
   "require": {
     "workerman/webman-framework": ">=2.1",
     "webman/database": ">=2.1",
+    "illuminate/database": ">=7.30",
     "illuminate/pagination": ">=7.30",
     "illuminate/events": ">=7.30",
     "intervention/image": "^2.7",

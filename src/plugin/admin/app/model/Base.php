@@ -3,15 +3,22 @@
 namespace plugin\admin\app\model;
 
 use DateTimeInterface;
+use plugin\admin\app\common\Database;
 use support\Model;
 
 
 class Base extends Model
 {
     /**
-     * @var string
+     * 获取数据库连接名
+     * 根据配置自动切换 MySQL/SQLite/PostgreSQL
+     *
+     * @return string
      */
-    protected $connection = 'plugin.admin.mysql';
+    public function getConnectionName(): string
+    {
+        return Database::getConnectionName();
+    }
 
     /**
      * 格式化日期

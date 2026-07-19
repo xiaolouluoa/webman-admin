@@ -3,6 +3,10 @@
 namespace plugin\admin\app\controller;
 
 use Illuminate\Database\Capsule\Manager;
+use plugin\admin\app\common\database\DatabaseAdapterInterface;
+use plugin\admin\app\common\database\MysqlAdapter;
+use plugin\admin\app\common\database\PgsqlAdapter;
+use plugin\admin\app\common\database\SqliteAdapter;
 use plugin\admin\app\common\Util;
 use support\exception\BusinessException;
 use support\Request;
@@ -10,7 +14,7 @@ use support\Response;
 use Webman\Captcha\CaptchaBuilder;
 
 /**
- * 安装
+ * 安装 - 支持多种数据库
  */
 class InstallController extends Base
 {
@@ -38,30 +42,38 @@ class InstallController extends Base
             return $this->json(1, '请运行 composer require -W illuminate/database 安装illuminate/database组件并重启');
         }
 
-        $user = $request->post('user');
-        $password = $request->post('password');
-        $database = $request->post('database');
-        $host = $request->post('host');
+        // 获取数据库类型
+        $dbType = $request->post('db_type', 'mysql');
+        $dbType = in_array($dbType, ['mysql', 'sqlite', 'pgsql']) ? $dbType : 'mysql';
+
+        $user = $request->post('user', '');
+        $password = $request->post('password', '');
+        $database = $request->post('database', '');
+        $host = $request->post('host', '127.0.0.1');
         $port = (int)$request->post('port') ?: 3306;
-        $overwrite = $request->post('overwrite');
+        $overwrite = $request->post('overwrite', false);
+
+        // SQLite特殊处理
+        if ($dbType === 'sqlite') {
+            return $this->installSqlite($request, $database, $overwrite);
+        }
+
+        $adapter = $this->createAdapter($dbType);
 
         try {
-            $db = $this->getPdo($host, $user, $password, $port);
-            $smt = $db->query("show databases like '$database'");
-            if (empty($smt->fetchAll())) {
-                $db->exec("create database $database");
-            }
+            $db = $this->getPdo($dbType, $host, $user, $password, $port, $database);
             $db->exec("use $database");
             $smt = $db->query("show tables");
             $tables = $smt->fetchAll();
         } catch (\Throwable $e) {
-            if (stripos($e, 'Access denied for user')) {
+            $msg = $e->getMessage();
+            if (stripos($msg, 'Access denied for user')) {
                 return $this->json(1, '数据库用户名或密码错误');
             }
-            if (stripos($e, 'Connection refused')) {
+            if (stripos($msg, 'Connection refused')) {
                 return $this->json(1, 'Connection refused. 请确认数据库IP端口是否正确，数据库已经启动');
             }
-            if (stripos($e, 'timed out')) {
+            if (stripos($msg, 'timed out')) {
                 return $this->json(1, '数据库连接超时，请确认数据库IP端口是否正确，安全组及防火墙已经放行端口');
             }
             throw $e;
@@ -88,11 +100,16 @@ class InstallController extends Base
             }
         } else {
             foreach ($tables_conflict as $table) {
-                $db->exec("DROP TABLE `$table`");
+                $quote = $adapter->quoteIdentifier($table);
+                $db->exec("DROP TABLE $quote");
             }
         }
 
-        $sql_file = base_path() . '/plugin/admin/install.sql';
+        // 根据数据库类型选择SQL文件
+        $sql_file = base_path() . "/plugin/admin/install_{$dbType}.sql";
+        if (!is_file($sql_file)) {
+            $sql_file = base_path() . '/plugin/admin/install.sql';
+        }
         if (!is_file($sql_file)) {
             return $this->json(1, '数据库SQL文件不存在');
         }
@@ -101,23 +118,161 @@ class InstallController extends Base
         $sql_query = $this->removeComments($sql_query);
         $sql_query = $this->splitSqlFile($sql_query, ';');
         foreach ($sql_query as $sql) {
-            $db->exec($sql);
+            if (trim($sql)) {
+                $db->exec($sql);
+            }
         }
 
         // 导入菜单
         $menus = include base_path() . '/plugin/admin/config/menu.php';
-        // 安装过程中没有数据库配置，无法使用api\Menu::import()方法
-        $this->importMenu($menus, $db);
+        $this->importMenu($menus, $db, $adapter);
 
+        // 生成数据库配置文件
+        $this->generateConfig($dbType, $host, $port, $database, $user, $password, $database_config_file);
+
+        // 尝试reload
+        if (function_exists('posix_kill')) {
+            set_error_handler(function () {});
+            posix_kill(posix_getppid(), SIGUSR1);
+            restore_error_handler();
+        }
+
+        return $this->json(0);
+    }
+
+    /**
+     * SQLite安装
+     * @param Request $request
+     * @param string $database
+     * @param bool $overwrite
+     * @return Response
+     * @throws \Throwable
+     */
+    protected function installSqlite(Request $request, string $database, bool $overwrite): Response
+    {
+        $database_config_file = base_path() . '/plugin/admin/config/database.php';
+        $dbPath = $database ?: base_path() . '/runtime/webman-admin.sqlite';
+
+        // 检查SQLite数据库文件是否存在
+        $tables_exist = [];
+        if (is_file($dbPath)) {
+            $pdo = new \PDO("sqlite:$dbPath");
+            $result = $pdo->query("SELECT name FROM sqlite_master WHERE type='table'");
+            if ($result) {
+                foreach ($result as $row) {
+                    $tables_exist[] = $row['name'];
+                }
+            }
+        }
+
+        $tables_to_install = [
+            'wa_admins', 'wa_admin_roles', 'wa_roles', 'wa_rules',
+            'wa_options', 'wa_users', 'wa_uploads',
+        ];
+
+        $tables_conflict = array_intersect($tables_to_install, $tables_exist);
+        if (!$overwrite) {
+            if ($tables_conflict) {
+                return $this->json(1, '以下表' . implode(',', $tables_conflict) . '已经存在，如需覆盖请选择强制覆盖');
+            }
+        } elseif (is_file($dbPath)) {
+            unlink($dbPath);
+        }
+
+        // 执行SQLite安装SQL
+        $sql_file = base_path() . '/plugin/admin/install_sqlite.sql';
+        if (!is_file($sql_file)) {
+            return $this->json(1, 'SQLite安装SQL文件不存在');
+        }
+
+        $pdo = new \PDO("sqlite:$dbPath");
+        $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+        $pdo->exec('PRAGMA journal_mode=WAL');
+        $pdo->exec('PRAGMA foreign_keys=ON');
+
+        $sql_query = file_get_contents($sql_file);
+        $sql_query = $this->removeComments($sql_query);
+        $sql_query = $this->splitSqlFile($sql_query, ';');
+        foreach ($sql_query as $sql) {
+            if (trim($sql)) {
+                $pdo->exec($sql);
+            }
+        }
+
+        // 导入菜单
+        $menus = include base_path() . '/plugin/admin/config/menu.php';
+        $adapter = new SqliteAdapter();
+        $this->importMenu($menus, $pdo, $adapter);
+
+        // 生成配置
         $config_content = <<<EOF
 <?php
-return  [
+return [
+    'default' => 'sqlite',
+    'connections' => [
+        'sqlite' => [
+            'driver'  => 'sqlite',
+            'database' => '$dbPath',
+            'prefix'  => '',
+        ],
+    ],
+];
+EOF;
+        file_put_contents($database_config_file, $config_content);
+
+        if (function_exists('posix_kill')) {
+            set_error_handler(function () {});
+            posix_kill(posix_getppid(), SIGUSR1);
+            restore_error_handler();
+        }
+
+        return $this->json(0);
+    }
+
+    /**
+     * 生成数据库配置
+     * @param string $dbType
+     * @param string $host
+     * @param int $port
+     * @param string $database
+     * @param string $user
+     * @param string $password
+     * @param string $configFile
+     * @return void
+     */
+    protected function generateConfig(string $dbType, string $host, int $port, string $database, string $user, string $password, string $configFile): void
+    {
+        if ($dbType === 'pgsql') {
+            $config = <<<EOF
+<?php
+return [
+    'default' => 'pgsql',
+    'connections' => [
+        'pgsql' => [
+            'driver'   => 'pgsql',
+            'host'     => '$host',
+            'port'     => $port,
+            'database' => '$database',
+            'username' => '$user',
+            'password' => '$password',
+            'charset'  => 'utf8',
+            'prefix'   => '',
+            'schema'   => 'public',
+            'sslmode'  => 'prefer',
+        ],
+    ],
+];
+EOF;
+        } else {
+            $config = <<<EOF
+<?php
+return [
     'default' => 'mysql',
     'connections' => [
         'mysql' => [
             'driver'      => 'mysql',
             'host'        => '$host',
-            'port'        => '$port',
+            'port'        => $port,
             'database'    => '$database',
             'username'    => '$user',
             'password'    => '$password',
@@ -130,57 +285,8 @@ return  [
     ],
 ];
 EOF;
-
-        file_put_contents($database_config_file, $config_content);
-
-        $think_orm_config = <<<EOF
-<?php
-return [
-    'default' => 'mysql',
-    'connections' => [
-        'mysql' => [
-            // 数据库类型
-            'type' => 'mysql',
-            // 服务器地址
-            'hostname' => '$host',
-            // 数据库名
-            'database' => '$database',
-            // 数据库用户名
-            'username' => '$user',
-            // 数据库密码
-            'password' => '$password',
-            // 数据库连接端口
-            'hostport' => $port,
-            // 数据库连接参数
-            'params' => [
-                // 连接超时3秒
-                \PDO::ATTR_TIMEOUT => 3,
-            ],
-            // 数据库编码默认采用utf8
-            'charset' => 'utf8mb4',
-            // 数据库表前缀
-            'prefix' => '',
-            // 断线重连
-            'break_reconnect' => true,
-            // 关闭SQL监听日志
-            'trigger_sql' => true,
-            // 自定义分页类
-            'bootstrap' =>  ''
-        ],
-    ],
-];
-EOF;
-        file_put_contents(base_path() . '/plugin/admin/config/thinkorm.php', $think_orm_config);
-
-
-        // 尝试reload
-        if (function_exists('posix_kill')) {
-            set_error_handler(function () {});
-            posix_kill(posix_getppid(), SIGUSR1);
-            restore_error_handler();
         }
-
-        return $this->json(0);
+        file_put_contents($configFile, $config);
     }
 
     /**
@@ -201,14 +307,18 @@ EOF;
             return $this->json(1, '请先完成第一步数据库配置');
         }
         $config = include $config_file;
-        $connection = $config['connections']['mysql'];
-        $pdo = $this->getPdo($connection['host'], $connection['username'], $connection['password'], $connection['port'], $connection['database']);
+        $default = $config['default'] ?? 'mysql';
+        $connection = $config['connections'][$default];
 
-        if ($pdo->query('select * from `wa_admins`')->fetchAll()) {
+        $pdo = $this->getPdoFromConfig($connection);
+
+        $adapter = $this->createAdapterFromConfig($connection);
+        $quote = $adapter->quoteIdentifier('wa_admins');
+
+        if ($pdo->query("select * from $quote")->fetchAll()) {
             return $this->json(1, '后台已经安装完毕，无法通过此页面创建管理员');
         }
 
-        $smt = $pdo->prepare("insert into `wa_admins` (`username`, `password`, `nickname`, `created_at`, `updated_at`) values (:username, :password, :nickname, :created_at, :updated_at)");
         $time = date('Y-m-d H:i:s');
         $data = [
             'username' => $username,
@@ -217,13 +327,25 @@ EOF;
             'created_at' => $time,
             'updated_at' => $time
         ];
+
+        $columns = [];
+        $values = [];
+        foreach ($data as $k => $v) {
+            $columns[] = $adapter->quoteIdentifier($k);
+            $values[] = ":$k";
+        }
+
+        $table = $adapter->quoteIdentifier('wa_admins');
+        $sql = "insert into $table (" . implode(',', $columns) . ") values (" . implode(',', $values) . ")";
+        $smt = $pdo->prepare($sql);
         foreach ($data as $key => $value) {
             $smt->bindValue($key, $value);
         }
         $smt->execute();
         $admin_id = $pdo->lastInsertId();
 
-        $smt = $pdo->prepare("insert into `wa_admin_roles` (`role_id`, `admin_id`) values (:role_id, :admin_id)");
+        $table = $adapter->quoteIdentifier('wa_admin_roles');
+        $smt = $pdo->prepare("insert into $table (role_id, admin_id) values (:role_id, :admin_id)");
         $smt->bindValue('role_id', 1);
         $smt->bindValue('admin_id', $admin_id);
         $smt->execute();
@@ -233,12 +355,58 @@ EOF;
     }
 
     /**
+     * 从配置创建PDO连接
+     * @param array $connection
+     * @return \PDO
+     */
+    protected function getPdoFromConfig(array $connection): \PDO
+    {
+        $driver = $connection['driver'] ?? 'mysql';
+        $host = $connection['host'] ?? '127.0.0.1';
+        $port = $connection['port'] ?? 3306;
+        $database = $connection['database'] ?? '';
+        $username = $connection['username'] ?? '';
+        $password = $connection['password'] ?? '';
+
+        return $this->getPdo($driver, $host, $username, $password, $port, $database);
+    }
+
+    /**
+     * 从配置创建适配器
+     * @param array $connection
+     * @return DatabaseAdapterInterface
+     */
+    protected function createAdapterFromConfig(array $connection): DatabaseAdapterInterface
+    {
+        $driver = $connection['driver'] ?? 'mysql';
+        return $this->createAdapter($driver);
+    }
+
+    /**
+     * 创建数据库适配器
+     * @param string $dbType
+     * @return DatabaseAdapterInterface
+     */
+    protected function createAdapter(string $dbType): DatabaseAdapterInterface
+    {
+        switch ($dbType) {
+            case 'pgsql':
+                return new PgsqlAdapter();
+            case 'sqlite':
+                return new SqliteAdapter();
+            default:
+                return new MysqlAdapter();
+        }
+    }
+
+    /**
      * 添加菜单
      * @param array $menu
      * @param \PDO $pdo
+     * @param DatabaseAdapterInterface $adapter
      * @return int
      */
-    protected function addMenu(array $menu, \PDO $pdo): int
+    protected function addMenu(array $menu, \PDO $pdo, DatabaseAdapterInterface $adapter): int
     {
         $allow_columns = ['title', 'key', 'icon', 'href', 'pid', 'weight', 'type'];
         $data = [];
@@ -255,9 +423,10 @@ EOF;
         }
         $columns = array_keys($data);
         foreach ($columns as $k => $column) {
-            $columns[$k] = "`$column`";
+            $columns[$k] = $adapter->quoteIdentifier($column);
         }
-        $sql = "insert into wa_rules (" .implode(',', $columns). ") values (" . implode(',', $values) . ")";
+        $table = $adapter->quoteIdentifier('wa_rules');
+        $sql = "insert into $table (" . implode(',', $columns) . ") values (" . implode(',', $values) . ")";
         $smt = $pdo->prepare($sql);
         foreach ($data as $key => $value) {
             $smt->bindValue($key, $value);
@@ -270,19 +439,22 @@ EOF;
      * 导入菜单
      * @param array $menu_tree
      * @param \PDO $pdo
+     * @param DatabaseAdapterInterface $adapter
      * @return void
      */
-    protected function importMenu(array $menu_tree, \PDO $pdo)
+    protected function importMenu(array $menu_tree, \PDO $pdo, DatabaseAdapterInterface $adapter)
     {
         if (is_numeric(key($menu_tree)) && !isset($menu_tree['key'])) {
             foreach ($menu_tree as $item) {
-                $this->importMenu($item, $pdo);
+                $this->importMenu($item, $pdo, $adapter);
             }
             return;
         }
         $children = $menu_tree['children'] ?? [];
         unset($menu_tree['children']);
-        $smt = $pdo->prepare("select * from wa_rules where `key`=:key limit 1");
+        $table = $adapter->quoteIdentifier('wa_rules');
+        $keyCol = $adapter->quoteIdentifier('key');
+        $smt = $pdo->prepare("select * from $table where $keyCol=:key limit 1");
         $smt->execute(['key' => $menu_tree['key']]);
         $old_menu = $smt->fetch();
         if ($old_menu) {
@@ -292,15 +464,15 @@ EOF;
                 'icon' => $menu_tree['icon'] ?? '',
                 'key' => $menu_tree['key'],
             ];
-            $sql = "update wa_rules set title=:title, icon=:icon where `key`=:key";
+            $sql = "update $table set title=:title, icon=:icon where $keyCol=:key";
             $smt = $pdo->prepare($sql);
             $smt->execute($params);
         } else {
-            $pid = $this->addMenu($menu_tree, $pdo);
+            $pid = $this->addMenu($menu_tree, $pdo, $adapter);
         }
         foreach ($children as $menu) {
             $menu['pid'] = $pid;
-            $this->importMenu($menu, $pdo);
+            $this->importMenu($menu, $pdo, $adapter);
         }
     }
 
@@ -311,7 +483,9 @@ EOF;
      */
     protected function removeComments($sql): string
     {
-        return preg_replace("/(\n--[^\n]*)/","", $sql);
+        $sql = preg_replace("/(\n--[^\n]*)/","", $sql);
+        $sql = preg_replace("/\/\*.*?\*\//s", "", $sql);
+        return $sql;
     }
 
     /**
@@ -365,27 +539,27 @@ EOF;
 
     /**
      * 获取pdo连接
-     * @param $host
-     * @param $username
-     * @param $password
-     * @param $port
-     * @param $database
+     * @param string $dbType
+     * @param string $host
+     * @param string $username
+     * @param string $password
+     * @param int $port
+     * @param string|null $database
      * @return \PDO
      */
-    protected function getPdo($host, $username, $password, $port, $database = null): \PDO
+    protected function getPdo(string $dbType, string $host, string $username, string $password, int $port, ?string $database = null): \PDO
     {
-        $dsn = "mysql:host=$host;port=$port;";
-        if ($database) {
-            $dsn .= "dbname=$database";
-        }
-        $params = [
-            \PDO::MYSQL_ATTR_INIT_COMMAND => "set names utf8mb4",
-            \PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => true,
-            \PDO::ATTR_EMULATE_PREPARES => false,
-            \PDO::ATTR_TIMEOUT => 5,
-            \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+        $adapter = $this->createAdapter($dbType);
+        $config = [
+            'host' => $host,
+            'port' => $port,
+            'database' => $database,
+            'username' => $username,
+            'password' => $password,
         ];
-        return new \PDO($dsn, $username, $password, $params);
+        $dsn = $adapter->getPdoDsn($config);
+        $options = $adapter->getPdoOptions();
+        return new \PDO($dsn, $username, $password, $options);
     }
 
 }

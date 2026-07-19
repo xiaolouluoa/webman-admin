@@ -5,6 +5,7 @@ namespace plugin\admin\app\controller;
 use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use plugin\admin\app\common\Auth;
+use plugin\admin\app\common\Database;
 use plugin\admin\app\common\Tree;
 use plugin\admin\app\common\Util;
 use support\exception\BusinessException;
@@ -89,13 +90,14 @@ class Crud extends Base
         $where = $request->get();
         $page = (int)$request->get('page');
         $page = $page > 0 ? $page : 1;
-        $table = config('plugin.admin.database.connections.mysql.prefix') . $this->model->getTable();
+        $table = Database::getPrefix() . $this->model->getTable();
 
-        $allow_column = Util::db()->select("desc `$table`");
+        $allow_column = Util::dbAdapter()->getTableColumns($table);
         if (!$allow_column) {
             throw new BusinessException('表不存在');
         }
-        $allow_column = array_column($allow_column, 'Field', 'Field');
+        $allow_column = array_keys($allow_column);
+        $allow_column = array_combine($allow_column, $allow_column);
         if (!in_array($field, $allow_column)) {
             $field = null;
         }
@@ -311,19 +313,23 @@ class Crud extends Base
      */
     protected function inputFilter(array $data): array
     {
-        $table = config('plugin.admin.database.connections.mysql.prefix') . $this->model->getTable();
-        $allow_column = $this->model->getConnection()->select("desc `$table`");
-        if (!$allow_column) {
+        $table = Database::getPrefix() . $this->model->getTable();
+        $columns = Util::dbAdapter()->getTableColumns($table);
+        if (!$columns) {
             throw new BusinessException('表不存在', 2);
         }
-        $columns = array_column($allow_column, 'Type', 'Field');
+        $columnTypes = [];
+        foreach ($columns as $field => $info) {
+            $columnTypes[$field] = $info['type'];
+        }
         foreach ($data as $col => $item) {
-            if (!isset($columns[$col])) {
+            if (!isset($columnTypes[$col])) {
                 unset($data[$col]);
                 continue;
             }
             // 非字符串类型传空则为null
-            if ($item === '' && strpos(strtolower($columns[$col]), 'varchar') === false && strpos(strtolower($columns[$col]), 'text') === false) {
+            $type = strtolower($columnTypes[$col]);
+            if ($item === '' && strpos($type, 'varchar') === false && strpos($type, 'text') === false && strpos($type, 'char') === false) {
                 $data[$col] = null;
             }
             if (is_array($item)) {

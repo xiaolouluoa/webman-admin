@@ -42,7 +42,7 @@ class Util
      */
     public static function db(): Connection
     {
-        return Db::connection('plugin.admin.mysql');
+        return Database::connection();
     }
 
     /**
@@ -51,7 +51,16 @@ class Util
      */
     public static function schema(): Builder
     {
-        return Db::schema('plugin.admin.mysql');
+        return Database::schema();
+    }
+
+    /**
+     * 获取数据库适配器
+     * @return \plugin\admin\app\common\database\DatabaseAdapterInterface
+     */
+    public static function dbAdapter()
+    {
+        return Database::adapter();
     }
 
     /**
@@ -382,28 +391,30 @@ class Util
     public static function getSchema($table, $section = null)
     {
         Util::checkTableName($table);
-        $database = config('database.connections')['plugin.admin.mysql']['database'];
-        $schema_raw = $section !== 'table' ? Util::db()->select("select * from information_schema.COLUMNS where TABLE_SCHEMA = '$database' and table_name = '$table' order by ORDINAL_POSITION") : [];
+        $adapter = static::dbAdapter();
+
+        $schema_raw = $section !== 'table' ? $adapter->getTableColumns($table) : [];
         $forms = [];
         $columns = [];
-        foreach ($schema_raw as $item) {
-            $field = $item->COLUMN_NAME;
+
+        foreach ($schema_raw as $field => $item) {
+            $typeInfo = $adapter->mapColumnType($item['type'], $item['type']);
             $columns[$field] = [
                 'field' => $field,
-                'type' => Util::typeToMethod($item->DATA_TYPE, (bool)strpos($item->COLUMN_TYPE, 'unsigned')),
-                'comment' => $item->COLUMN_COMMENT,
-                'default' => $item->COLUMN_DEFAULT,
-                'length' => static::getLengthValue($item),
-                'nullable' => $item->IS_NULLABLE !== 'NO',
-                'primary_key' => $item->COLUMN_KEY === 'PRI',
-                'auto_increment' => strpos($item->EXTRA, 'auto_increment') !== false
+                'type' => Util::typeToMethod($typeInfo['type'], $typeInfo['unsigned']),
+                'comment' => $item['comment'],
+                'default' => $item['default'],
+                'length' => static::getLengthValueFromAdapter($item, $typeInfo),
+                'nullable' => $item['null'] !== 'NO',
+                'primary_key' => $item['key'] === 'PRI',
+                'auto_increment' => $typeInfo['auto_increment'],
             ];
 
             $forms[$field] = [
                 'field' => $field,
-                'comment' => $item->COLUMN_COMMENT,
-                'control' => static::typeToControl($item->DATA_TYPE),
-                'form_show' => $item->COLUMN_KEY !== 'PRI',
+                'comment' => $item['comment'],
+                'control' => static::typeToControl($typeInfo['type']),
+                'form_show' => $item['key'] !== 'PRI',
                 'list_show' => true,
                 'enable_sort' => false,
                 'searchable' => false,
@@ -411,34 +422,29 @@ class Util
                 'control_args' => '',
             ];
         }
-        $table_schema = $section == 'table' || !$section ? Util::db()->select("SELECT TABLE_COMMENT FROM  information_schema.`TABLES` WHERE  TABLE_SCHEMA='$database' and TABLE_NAME='$table'") : [];
-        $indexes = !$section || in_array($section, ['keys', 'table']) ? Util::db()->select("SHOW INDEX FROM `$table`") : [];
-        $keys = [];
+
+        $tableComment = $section == 'table' || !$section ? $adapter->getTableComment($table) : null;
+
+        $indexes = [];
         $primary_key = [];
-        foreach ($indexes as $index) {
-            $key_name = $index->Key_name;
-            if ($key_name == 'PRIMARY') {
-                $primary_key[] = $index->Column_name;
-                continue;
+        if (!$section || in_array($section, ['keys', 'table'])) {
+            $indexes = $adapter->getTableIndexes($table);
+            foreach ($columns as $field => $col) {
+                if ($col['primary_key']) {
+                    $primary_key[] = $field;
+                }
             }
-            if (!isset($keys[$key_name])) {
-                $keys[$key_name] = [
-                    'name' => $key_name,
-                    'columns' => [],
-                    'type' => $index->Non_unique == 0 ? 'unique' : 'normal'
-                ];
-            }
-            $keys[$key_name]['columns'][] = $index->Column_name;
         }
 
         $data = [
-            'table' => ['name' => $table, 'comment' => $table_schema[0]->TABLE_COMMENT ?? '', 'primary_key' => $primary_key],
+            'table' => ['name' => $table, 'comment' => $tableComment ?? '', 'primary_key' => $primary_key],
             'columns' => $columns,
             'forms' => $forms,
-            'keys' => array_reverse($keys, true)
+            'keys' => $indexes,
         ];
 
-        $schema = Option::where('name', "table_form_schema_$table")->value('value');
+        $optionName = "table_form_schema_$table";
+        $schema = Option::where('name', $optionName)->value('value');
         $form_schema_map = $schema ? json_decode($schema, true) : [];
 
         foreach ($data['forms'] as $field => $item) {
@@ -451,26 +457,27 @@ class Util
     }
 
     /**
-     * 获取字段长度或默认值
-     * @param $schema
+     * 从适配器获取字段长度或默认值
+     * @param $item
+     * @param $typeInfo
      * @return mixed|string
      */
-    public static function getLengthValue($schema)
+    public static function getLengthValueFromAdapter($item, $typeInfo)
     {
-        $type = $schema->DATA_TYPE;
+        $type = $typeInfo['type'];
+        $length = $typeInfo['length'] ?? '';
+
         if (in_array($type, ['float', 'decimal', 'double'])) {
-            return "{$schema->NUMERIC_PRECISION},{$schema->NUMERIC_SCALE}";
+            return $length;
         }
         if ($type === 'enum') {
-            return implode(',', array_map(function($item){
-                return trim($item, "'");
-            }, explode(',', substr($schema->COLUMN_TYPE, 5, -1))));
+            return $length;
         }
-        if (in_array($type, ['varchar', 'text', 'char'])) {
-            return $schema->CHARACTER_MAXIMUM_LENGTH;
+        if (in_array($type, ['string', 'char'])) {
+            return $length ?: 255;
         }
-        if (in_array($type, ['time', 'datetime', 'timestamp'])) {
-            return $schema->CHARACTER_MAXIMUM_LENGTH;
+        if (in_array($type, ['datetime', 'date', 'time', 'timestamp'])) {
+            return $length;
         }
         return '';
     }
