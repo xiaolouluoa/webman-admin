@@ -204,43 +204,47 @@
             if (driver === "sqlite") {
                 $("#mysql-fields").hide();
                 $("#sqlite-fields").show();
-                // 清除验证
-                $("#mysql-fields input").each(function() {
-                    $(this).removeAttr("lay-verify required");
-                });
+                // 禁用 MySQL 字段组，使其不被提交
+                $("#mysql-fields input, #mysql-fields select").prop("disabled", true);
+                // 启用 SQLite 字段组
+                $("#sqlite-fields input, #sqlite-fields select").prop("disabled", false);
                 // 设置默认值
                 $("#sqlite-path").val(driverDbMap[driver]);
             } else {
                 $("#mysql-fields").show();
                 $("#sqlite-fields").hide();
+                // 启用 MySQL 字段组
+                $("#mysql-fields input, #mysql-fields select").prop("disabled", false);
+                // 禁用 SQLite 字段组，使其不被提交
+                $("#sqlite-fields input, #sqlite-fields select").prop("disabled", true);
                 $("#host-input").val(driverHostMap[driver]);
                 $("#port-input").val(driverPortMap[driver]);
                 $("#database-input").val(driverDbMap[driver]);
-                // 恢复验证
-                $("#mysql-fields input[name='host'], #mysql-fields input[name='database']").each(function() {
-                    $(this).attr("lay-verify", "required").attr("required", "required");
-                });
             }
             form.render();
         });
 
         form.on("submit(formStep)", function(data) {
             var driver = data.field.driver;
-            var postData = data.field;
+            var postData = {};
 
-            // SQLite 特殊处理
+            // 手动构造提交数据，避免同 name 字段冲突
+            postData.driver = driver;
+            postData.overwrite = data.field.overwrite ? 1 : 0;
+
             if (driver === "sqlite") {
+                postData.database = $("#sqlite-path").val() || "plugin/admin/database.sqlite";
                 postData.host = "";
                 postData.port = 0;
                 postData.user = "";
                 postData.password = "";
-                if (!postData.database) {
-                    postData.database = "plugin/admin/database.sqlite";
-                }
+            } else {
+                postData.database = $("#database-input").val();
+                postData.host = $("#host-input").val();
+                postData.port = parseInt($("#port-input").val()) || 0;
+                postData.user = data.field.user;
+                postData.password = data.field.password;
             }
-
-            // 端口转换为整数
-            postData.port = parseInt(postData.port) || 0;
 
             let loading = layer.load();
             $.ajax({

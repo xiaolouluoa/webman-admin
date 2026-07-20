@@ -44,7 +44,9 @@ class Util
      */
     public static function getDriver(): string
     {
-        return config('database.connections.' . static::$connectionName . '.driver', 'mysql');
+        $connections = config('database.connections', []);
+        $connection = $connections[static::$connectionName] ?? [];
+        return $connection['driver'] ?? 'mysql';
     }
 
     /**
@@ -93,7 +95,8 @@ class Util
      */
     public static function getConnectionConfig(): array
     {
-        return config('database.connections.' . static::$connectionName, []);
+        $connections = config('database.connections', []);
+        return $connections[static::$connectionName] ?? [];
     }
 
     /**
