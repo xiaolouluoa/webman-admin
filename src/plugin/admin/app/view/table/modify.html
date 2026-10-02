@@ -646,30 +646,27 @@
                             }
 
                             window.keyColumnMultiSelectRender = function () {
-                                layui.use(["jquery", "xmSelect", "table"], function () {
-                                    let $ = layui.$;
-                                    let table = layui.table;
-                                    let columnData = table.getData("column-table");
-                                    let data = [];
-                                    layui.each(columnData, function (i, item) {
-                                        if (item.field) {
-                                            data.push({
-                                                name: item.field, value:item.field
-                                            });
-                                        }
-                                    });
-                                    layui.each($(".key-columns-div"), function (_, dom) {
-                                        let name = $(dom).attr("name");
-                                        let value = $(dom).attr("value");
-                                        let initValue = value ? value.split(",") : [];
-                                        layui.xmSelect.render({
-                                            el: dom,
-                                            name: name,
-                                            initValue: initValue,
-                                            data: data,
-                                        })
-                                    });
-
+                                let $ = layui.$;
+                                let table = layui.table;
+                                let columnData = table.getData("column-table");
+                                let data = [];
+                                layui.each(columnData, function (i, item) {
+                                    if (item.field) {
+                                        data.push({
+                                            name: item.field, value:item.field
+                                        });
+                                    }
+                                });
+                                layui.each($(".key-columns-div"), function (_, dom) {
+                                    let name = $(dom).attr("name");
+                                    let value = $(dom).attr("value");
+                                    let initValue = value ? value.split(",") : [];
+                                    layui.xmSelect.render({
+                                        el: dom,
+                                        name: name,
+                                        initValue: initValue,
+                                        data: data,
+                                    })
                                 });
                             }
 

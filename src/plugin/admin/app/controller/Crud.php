@@ -114,10 +114,7 @@ class Crud extends Base
             if ($this->dataLimit === 'personal') {
                 $where[$this->dataLimitField] = admin_id();
             } elseif ($this->dataLimit === 'auth') {
-                $primary_key = $this->model->getKeyName();
-                if (!Auth::isSuperAdmin() && (!isset($where[$primary_key]) || $this->dataLimitField != $primary_key)) {
-                    $where[$this->dataLimitField] = ['in', Auth::getScopeAdminIds(true)];
-                }
+                $where[$this->dataLimitField] = ['in', Auth::getScopeAdminIds(true)];
             }
         }
         return [$where, $format, $limit, $field, $order, $page];
@@ -213,7 +210,7 @@ class Crud extends Base
             } elseif ($this->dataLimit === 'auth') {
                 if (!empty($data[$this->dataLimitField])) {
                     $admin_id = $data[$this->dataLimitField];
-                    if (!in_array($admin_id, Auth::getScopeAdminIds(true))) {
+                    if (!in_array((int)$admin_id, Auth::getScopeAdminIds(true), true)) {
                         throw new BusinessException('无数据权限');
                     }
                 } else {
@@ -271,7 +268,7 @@ class Crud extends Base
                     $model->{$this->dataLimitField} ?? false // 检查要更新的记录的admin_id是否有权限
                 ];
                 foreach ($admin_ids as $admin_id) {
-                    if ($admin_id && !in_array($admin_id, $scopeAdminIds)) {
+                    if ($admin_id && !in_array((int)$admin_id, $scopeAdminIds, true)) {
                         throw new BusinessException('无数据权限');
                     }
                 }
@@ -363,8 +360,9 @@ class Crud extends Base
             if ($this->dataLimit) {
                 $admin_ids = $this->model->where($primary_key, $ids)->pluck($this->dataLimitField)->toArray();
             }
+            $admin_ids = array_map('intval', $admin_ids);
             if ($this->dataLimit == 'personal') {
-                if (!in_array(admin_id(), $admin_ids)) {
+                if (array_diff($admin_ids, [(int)admin_id()])) {
                     throw new BusinessException('无数据权限');
                 }
             } elseif ($this->dataLimit == 'auth') {
